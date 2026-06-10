@@ -18,6 +18,7 @@
 use crate::SecureStorageDb;
 use crate::Storable;
 use anyhow::{anyhow, Result};
+use optee_utee::ObjectStorageConstants;
 use std::{
     string::ToString,
     collections::HashMap,
@@ -34,9 +35,56 @@ pub struct SecureStorageClient {
 }
 
 impl SecureStorageClient {
+    /// Open a REE-FS backed database (legacy default).
     pub fn open(db_name: &str) -> Result<Self> {
         Ok(Self {
             db: Arc::new(RwLock::new(SecureStorageDb::open(db_name.to_string())?)),
+        })
+    }
+
+    /// Open an RPMB-backed database.
+    /// RPMB provides hardware-protected anti-replay / anti-rollback storage:
+    /// data is authenticated via HMAC-SHA256 and stored in the eMMC RPMB
+    /// partition, which cannot be rolled back even with direct NAND access.
+    pub fn open_rpmb(db_name: &str) -> Result<Self> {
+        Ok(Self {
+            db: Arc::new(RwLock::new(SecureStorageDb::open_rpmb(db_name.to_string())?)),
+        })
+    }
+
+    /// Open RPMB database, migrating existing REE-FS entries if RPMB is empty.
+    ///
+    /// On first call after a firmware upgrade, the RPMB database will be empty
+    /// while the REE-FS database has existing wallet data. This method detects
+    /// that situation and transparently migrates all entries, then deletes the
+    /// REE-FS copy. Safe to call on a device that was already migrated (no-op).
+    pub fn open_rpmb_migrating(db_name: &str) -> Result<Self> {
+        let rpmb_db = SecureStorageDb::open_rpmb(db_name.to_string())?;
+        if rpmb_db.is_empty() {
+            // Check whether REE-FS has data to migrate
+            let mut ree_db = SecureStorageDb::open(db_name.to_string())?;
+            if !ree_db.is_empty() {
+                // Collect all REE-FS entries; migrate to RPMB one by one.
+                // We cannot call list_entries_with_prefix because we don't know
+                // the prefix here — use the raw prefix "" to get everything.
+                let all = ree_db.list_entries_with_prefix("")?;
+                let mut rpmb = SecureStorageDb::open_rpmb(db_name.to_string())?;
+                for (k, v) in &all {
+                    rpmb.put(k.clone(), v.clone())?;
+                }
+                // Wipe REE-FS after successful RPMB write
+                ree_db.clear()?;
+                return Ok(Self { db: Arc::new(RwLock::new(rpmb)) });
+            }
+        }
+        Ok(Self { db: Arc::new(RwLock::new(rpmb_db)) })
+    }
+
+    pub fn open_with_storage(db_name: &str, storage: ObjectStorageConstants) -> Result<Self> {
+        Ok(Self {
+            db: Arc::new(RwLock::new(
+                SecureStorageDb::open_with_storage(db_name.to_string(), storage)?,
+            )),
         })
     }
 

@@ -39,9 +39,13 @@ impl Into<raw::TEE_Whence> for Whence {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ObjectStorageConstants {
     Private = 0x00000001,
+    /// RPMB-backed storage. Provides hardware anti-rollback via eMMC RPMB partition.
+    /// GP TEE Internal Core API v1.3.1 §5.11.1 — TEE_STORAGE_PRIVATE_RPMB = 0x80000003.
+    Rpmb = 0x80000003,
     IllegalValue = 0x7FFFFFFF,
 }
 

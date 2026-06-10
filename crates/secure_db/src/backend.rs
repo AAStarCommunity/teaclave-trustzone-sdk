@@ -18,29 +18,33 @@
 use anyhow::{anyhow, bail, Result};
 use optee_utee::{DataFlag, GenericObject, ObjectStorageConstants, PersistentObject};
 
-// Wrapper functions for OP-TEE raw API
+// Wrapper functions for OP-TEE raw API.
+// All functions accept a `storage` parameter so callers can choose between
+// REE-FS (`ObjectStorageConstants::Private`) and RPMB
+// (`ObjectStorageConstants::Rpmb`).
 
-pub fn save_in_secure_storage(obj_id: &[u8], data: &[u8]) -> Result<()> {
+pub fn save_in_secure_storage(
+    storage: ObjectStorageConstants,
+    obj_id: &[u8],
+    data: &[u8],
+) -> Result<()> {
     let obj_data_flag = DataFlag::ACCESS_READ
         | DataFlag::ACCESS_WRITE
         | DataFlag::ACCESS_WRITE_META
         | DataFlag::OVERWRITE;
 
-    PersistentObject::create(
-        ObjectStorageConstants::Private,
-        obj_id,
-        obj_data_flag,
-        None,
-        data,
-    )
-    .map_err(|e| anyhow!("[-] {:?}: failed to create object: {:?}", &obj_id, e))?;
+    PersistentObject::create(storage, obj_id, obj_data_flag, None, data)
+        .map_err(|e| anyhow!("[-] {:?}: failed to create object: {:?}", &obj_id, e))?;
 
     Ok(())
 }
 
-pub fn load_from_secure_storage(obj_id: &[u8]) -> Result<Option<Vec<u8>>> {
+pub fn load_from_secure_storage(
+    storage: ObjectStorageConstants,
+    obj_id: &[u8],
+) -> Result<Option<Vec<u8>>> {
     match PersistentObject::open(
-        ObjectStorageConstants::Private,
+        storage,
         obj_id,
         DataFlag::ACCESS_READ | DataFlag::SHARE_READ,
     ) {
@@ -65,9 +69,9 @@ pub fn load_from_secure_storage(obj_id: &[u8]) -> Result<Option<Vec<u8>>> {
     }
 }
 
-pub fn delete_from_secure_storage(obj_id: &[u8]) -> Result<()> {
+pub fn delete_from_secure_storage(storage: ObjectStorageConstants, obj_id: &[u8]) -> Result<()> {
     match PersistentObject::open(
-        ObjectStorageConstants::Private,
+        storage,
         obj_id,
         DataFlag::ACCESS_READ | DataFlag::ACCESS_WRITE_META,
     ) {
