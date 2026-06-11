@@ -18,10 +18,10 @@
 use crate::SecureStorageDb;
 use crate::Storable;
 use anyhow::{anyhow, Result};
+use hashbrown::HashMap;
 use optee_utee::ObjectStorageConstants;
 use std::{
     string::ToString,
-    collections::HashMap,
     convert::TryFrom,
     hash::Hash,
     sync::{Arc, RwLock},
@@ -83,14 +83,41 @@ impl SecureStorageClient {
         // "TableName#key" prefix), so it cannot collide with any Storable entry
         // (Storable::storage_key always contains a '#' separator).
         const MIGRATION_MARKER_KEY: &str = "__rpmb_migration_complete_v1";
+        // Probe key used to detect whether RPMB is actually writable on this
+        // device (see REE-FS fallback below).
+        const RPMB_PROBE_KEY: &str = "__rpmb_probe_v1";
 
-        let mut rpmb_db = SecureStorageDb::open_rpmb(db_name.to_string())?;
+        // REE-FS fallback: on hardware where the eMMC RPMB authentication key
+        // has never been programmed (e.g. NXP FRDM-IMX93 out of the box,
+        // `mmc rpmb read-counter` → retcode 0x0007), every RPMB write fails with
+        // TEE_ERROR_* and wallet creation would be impossible. Rather than fail,
+        // we transparently fall back to REE-FS (TEE_STORAGE_PRIVATE), exactly
+        // what v0.19.0 used. This keeps the device fully functional; the only
+        // thing lost is hardware anti-rollback, which REE-FS never had anyway.
+        // When the RPMB key is later programmed (production — see issue #50),
+        // the probe succeeds and storage transparently upgrades to RPMB +
+        // migrates any REE-FS wallets.
+        let mut rpmb_db = match SecureStorageDb::open_rpmb(db_name.to_string()) {
+            Ok(db) => db,
+            Err(_) => {
+                return Self::open(db_name); // RPMB backend unavailable → REE-FS
+            }
+        };
 
-        // If the marker is present, migration already finished — fast path.
+        // If the marker is present, migration already finished — fast path
+        // (also proves RPMB is readable, so no probe needed).
         // get() returns Err on not-found; treat any error as "marker absent".
         let migration_done = rpmb_db.get(MIGRATION_MARKER_KEY).is_ok();
 
         if !migration_done {
+            // Probe RPMB writability. On a device whose RPMB key is not
+            // programmed this put() fails — fall back to REE-FS instead of
+            // bricking wallet creation.
+            if rpmb_db.put(RPMB_PROBE_KEY.to_string(), vec![1u8]).is_err() {
+                return Self::open(db_name); // RPMB not writable → REE-FS
+            }
+            let _ = rpmb_db.delete(RPMB_PROBE_KEY); // best-effort cleanup
+
             let mut ree_db = SecureStorageDb::open(db_name.to_string())?;
             if !ree_db.is_empty() {
                 // Phase 1: per-entry idempotent copy. Only copy keys that are
@@ -176,12 +203,16 @@ impl SecureStorageClient {
     where
         V: Storable,
     {
-        let map = self
+        // Count from the in-memory key list only — NO per-entry object reads.
+        // list_entries_with_prefix would issue one storage read syscall per
+        // entry, each of which can corrupt the TA's TLS register and make a
+        // subsequent thread_local access panic. Counting keys avoids all of it.
+        let count = self
             .db
             .read()
             .map_err(|_| anyhow!("Failed to acquire read lock"))?
-            .list_entries_with_prefix(V::table_name())?;
-        Ok(map.len())
+            .count_keys_with_prefix(V::table_name());
+        Ok(count)
     }
 
     pub fn list_entries<V>(&self) -> Result<HashMap<V::Key, V>>

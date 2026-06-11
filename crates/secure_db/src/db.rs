@@ -17,9 +17,9 @@
 
 use crate::{delete_from_secure_storage, load_from_secure_storage, save_in_secure_storage};
 use anyhow::{bail, ensure, Result};
+use hashbrown::HashMap;
 use hashbrown::HashSet;
 use optee_utee::ObjectStorageConstants;
-use std::collections::HashMap;
 
 // SecureStorageDb is a key-value storage for TA to easily store and retrieve data.
 // First we store the key list in the secure storage, named as db_name.
@@ -124,6 +124,15 @@ impl SecureStorageDb {
 
     pub fn is_empty(&self) -> bool {
         self.key_list.is_empty()
+    }
+
+    /// Count keys matching a prefix WITHOUT reading any object data.
+    /// The key list is already in memory, so this issues zero secure-storage
+    /// read syscalls — important inside a TA where each storage syscall can
+    /// corrupt the TLS register (tpidr_el0). Use this instead of
+    /// list_entries_with_prefix(..).len() when only the count is needed.
+    pub fn count_keys_with_prefix(&self, prefix: &str) -> usize {
+        self.key_list.iter().filter(|k| k.starts_with(prefix)).count()
     }
 
     fn store_key_list(&self) -> Result<()> {
