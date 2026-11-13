@@ -42,157 +42,140 @@ jobs:
       runs-on: ubuntu-24.04-arm
       container: ghcr.io/ivila/teaclave-trustzone-sdk-ci-runner:ubuntu-24.04
 
-  # Run systest of optee_teec and build systest of optee_utee on ARM64
-  systest:
+  # Regenerate the committed `*-sys` bindings from the OP-TEE release pinned in
+  # optee-version.txt and fail if the committed files are stale.
+  check-generated-bindings:
     runs-on: ubuntu-24.04-arm
     container: ghcr.io/ivila/teaclave-trustzone-sdk-ci-runner:ubuntu-24.04
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Prepare Environment
+      - name: Cache Cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+          key: cargo-v1-bindings-${{ hashFiles('rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-v1-bindings-
+
+      - name: Install libclang
+        run: |
+          # bindgen dlopens libclang at run time and the runner image does not
+          # ship it.
+          apt-get update
+          apt-get install -y --no-install-recommends libclang-dev
+          echo "LIBCLANG_PATH=$(dirname "$(find /usr/lib -name libclang.so -print -quit)")" >> "$GITHUB_ENV"
+
+      - name: Regenerate the bindings
         run: |
           # Setup Rust and toolchains
           ./setup.sh
           source "$HOME/.cargo/env"
-          # Build optee_os and optee_client for qemu_v8
-          ./build_optee_libraries.sh $HOME
-          # Setup environment
-          export OPTEE_DIR=$HOME
+
+          # Build the dev kit and client export of the pinned OP-TEE release
+          ./build_optee_libraries.sh "$HOME"
+          export OPTEE_DIR="$HOME"
           source environment
-          # Run systest
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$OPTEE_DIR/optee_client/export_arm64/usr/lib
-          (cd crates && cargo run -p optee-teec-systest && cargo build -p optee-utee-systest)
 
-  # Test build no-std examples on dev docker container
-  test-nostd-build-on-dev-docker:
-    runs-on: ubuntu-latest
-    container: 
-      image: teaclave/teaclave-trustzone-emulator-nostd-expand-memory:latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Setup environment
-        run: |
-          # Run entrypoint.sh to set up the bash profile
-          /entrypoint.sh true
-      - name: Build no-std and common examples
-        shell: bash -l {0}  # Use login shell to load the profile
-        run: |
-          make
+          cargo run --manifest-path xtask/Cargo.toml -- generate-bindings all
 
-  # Test build std examples on dev docker container
-  test-std-build-on-dev-docker:
-    runs-on: ubuntu-latest
-    container:
-      image: teaclave/teaclave-trustzone-emulator-std-expand-memory:latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Setup environment
+      - name: Fail if the committed bindings are stale
         run: |
-          # Run entrypoint.sh to set up the bash profile
-          /entrypoint.sh true
-      - name: Build no-std and common examples
-        shell: bash -l {0}  # Use login shell to load the profile
-        run: |
-          ln -s $RUST_STD_DIR rust
-          make std-examples
+          # The step runs as root inside the container while the workspace
+          # belongs to the runner user, so git has to be told that the
+          # repository is safe before it will read the index.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-  # Test cargo-optee build no-std examples - aarch64
-  test-cargo-optee-nostd-aarch64:
-    runs-on: ubuntu-latest
-    container: 
-      image: teaclave/teaclave-trustzone-emulator-nostd-expand-memory:latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Setup environment
-        run: |
-          # Run entrypoint.sh to set up the bash profile
-          /entrypoint.sh true
-      - name: Test cargo-optee no-std build (aarch64)
-        shell: bash -l {0}  # Use login shell to load the profile
-        run: |
-          # Build using cargo-optee tool with default aarch64 settings
-          ./ci/build.sh
+          git diff --exit-code -- \
+            crates/optee-utee-sys/src/generated.rs \
+            crates/optee-teec-sys/src/generated.rs
 
-  # Test cargo-optee build no-std examples - arm32
-  test-cargo-optee-nostd-arm32:
-    runs-on: ubuntu-latest
-    container: 
-      image: teaclave/teaclave-trustzone-emulator-nostd-expand-memory:latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Setup environment
-        run: |
-          # Run entrypoint.sh to set up the bash profile
-          /entrypoint.sh true
-      - name: Test cargo-optee no-std build (arm32)
-        shell: bash -l {0}  # Use login shell to load the profile
-        run: |
-          # Switch to ARM32 configuration and build
-          # Note: Explicit environment reload needed for GitHub Actions
-          # (wrapper function in .bashrc not working for non-interactive shells: docker exec cmd=[...])
-          # We can fix this by updating entrypoint.sh to make ~/.profile source ~/.bashrc
-          switch_config --ta no-std/arm32 && \
-          switch_config --host arm32 && \
-          source ${TEACLAVE_TOOLCHAIN_BASE}/environment && \
-          ./ci/build.sh --ta arm --host arm
-
-  # Test cargo-optee build std examples - aarch64
-  test-cargo-optee-std-aarch64:
+  # Build examples in the emulator image: arch × std.
+  test-build-on-dev-docker:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            std: false
+            ta: no-std/aarch64
+            host: aarch64
+            image: teaclave/teaclave-trustzone-emulator-nostd-expand-memory:latest
+          - arch: arm32
+            std: false
+            ta: no-std/arm32
+            host: arm32
+            image: teaclave/teaclave-trustzone-emulator-nostd-expand-memory:latest
+          - arch: aarch64
+            std: true
+            ta: std/aarch64
+            host: aarch64
+            image: teaclave/teaclave-trustzone-emulator-std-expand-memory:latest
+          - arch: arm32
+            std: true
+            ta: std/arm32
+            host: arm32
+            image: teaclave/teaclave-trustzone-emulator-std-expand-memory:latest
+    name: test-build-on-dev-docker (${{ matrix.arch }}, ${{ matrix.std && 'std' || 'no-std' }})
     runs-on: ubuntu-latest
     container:
-      image: teaclave/teaclave-trustzone-emulator-std-expand-memory:latest
+      image: ${{ matrix.image }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+      - name: Cache Cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            /opt/teaclave/cargo/registry/cache
+            /opt/teaclave/cargo/registry/index
+          key: cargo-v1-dev-docker-${{ matrix.std }}-${{ hashFiles('rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-v1-dev-docker-${{ matrix.std }}-
       - name: Setup environment
+        run: /entrypoint.sh true
+      - name: Build examples
+        shell: bash -l {0}
         run: |
-          # Run entrypoint.sh to set up the bash profile
-          /entrypoint.sh true
-      - name: Test cargo-optee std build (aarch64)
-        shell: bash -l {0}  # Use login shell to load the profile
-        run: |
-          # Link rust directory for std support
-          ln -s $RUST_STD_DIR rust
-          # Build using cargo-optee tool with default aarch64 std settings
-          ./ci/build.sh --std
+          if [ "${{ matrix.std }}" = "true" ]; then
+            ln -s "$RUST_STD_DIR" rust
+          fi
+          switch_config --ta ${{ matrix.ta }} && \
+          switch_config --host ${{ matrix.host }} && \
+          source "${TEACLAVE_TOOLCHAIN_BASE}/environment" && \
+          if [ "${{ matrix.std }}" = "true" ]; then
+            make std-examples
+          else
+            make
+          fi
 
-  # Test cargo-optee build std examples - arm32
-  test-cargo-optee-std-arm32:
+
+  unused-dependencies:
     runs-on: ubuntu-latest
-    container:
-      image: teaclave/teaclave-trustzone-emulator-std-expand-memory:latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
-      - name: Setup environment
+        uses: actions/checkout@v7
+      - name: Install cargo-machete
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-machete@0.9.2
+      - name: Check for unused dependencies
         run: |
-          # Run entrypoint.sh to set up the bash profile
-          /entrypoint.sh true
-      - name: Test cargo-optee std build (arm32)
-        shell: bash -l {0}  # Use login shell to load the profile
-        run: |
-          # Link rust directory for std support
-          ln -s $RUST_STD_DIR rust
-          # Switch to ARM32 std configuration and build
-          # Note: Explicit environment reload needed for GitHub Actions
-          # (wrapper function in .bashrc not working for non-interactive shells: docker exec cmd=[...])
-          # We can fix this by updating entrypoint.sh to make ~/.profile source ~/.bashrc
-          switch_config --ta std/arm32 && \
-          switch_config --host arm32 && \
-          source ${TEACLAVE_TOOLCHAIN_BASE}/environment && \
-          ./ci/build.sh --ta arm --host arm --std
+          for dir in crates examples/ta examples/ca tools projects/web3/eth_wallet; do
+            echo "::group::cargo machete ($dir)"
+            (cd "$dir" && cargo machete)
+            echo "::endgroup::"
+          done
 
   license:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check License Header
-        uses: apache/skywalking-eyes/header@v0.7.0
+        uses: apache/skywalking-eyes/header@v0.8.0
         with:
           config: .licenserc.yaml
           mode: check

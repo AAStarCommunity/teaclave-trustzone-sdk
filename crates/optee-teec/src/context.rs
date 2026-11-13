@@ -15,8 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{ConnectionMethods, Error, Operation, Param, ParamNone, Result, Session, Uuid, raw};
-use std::{cell::RefCell, ptr, rc::Rc};
+use crate::{
+    ConnectionMethods, Operation, Param, ParamNone, Result, Session, Uuid, raw, teec_check,
+};
+use std::{
+    ptr,
+    sync::{Arc, Mutex},
+};
 
 pub struct InnerContext(pub raw::TEEC_Context);
 
@@ -31,17 +36,12 @@ impl Drop for InnerContext {
 /// An abstraction of the logical connection between a client application and a
 /// TEE.
 pub struct Context {
-    // Use Rc to share it with Session, eliminating the lifetime constraint.
-    // Use RefCell to allow conversion into a raw mutable pointer.
-    // As RefCell is not Send + Sync, there is no need to use Arc.
-    raw: Rc<RefCell<InnerContext>>,
+    // Sessions keep an `Arc` clone so the OP-TEE context outlives them. The
+    // mutex serializes access to the shared handle and makes it `Send + Sync`:
+    // `raw::TEEC_Context` contains only scalars, so `Arc<Mutex<InnerContext>>`
+    // gets both traits automatically, without any `unsafe impl`.
+    raw: Arc<Mutex<InnerContext>>,
 }
-
-// Since RefCell is used for Context, Rust does not automatically implement
-// Send and Sync for it. We need to manually implement them and ensure that
-// InnerContext is used correctly.
-unsafe impl Send for Context {}
-unsafe impl Sync for Context {}
 
 impl Context {
     /// Creates a TEE client context object.
@@ -59,12 +59,10 @@ impl Context {
         // SAFETY:
         // raw_ctx is a C struct(TEEC_Context), which zero value is valid.
         let mut raw_ctx = unsafe { std::mem::zeroed() };
-        match unsafe { raw::TEEC_InitializeContext(ptr::null_mut(), &mut raw_ctx) } {
-            raw::TEEC_SUCCESS => Ok(Self {
-                raw: Rc::new(RefCell::new(InnerContext(raw_ctx))),
-            }),
-            code => Err(Error::from_raw_error(code)),
-        }
+        teec_check(unsafe { raw::TEEC_InitializeContext(ptr::null_mut(), &mut raw_ctx) })?;
+        Ok(Self {
+            raw: Arc::new(Mutex::new(InnerContext(raw_ctx))),
+        })
     }
 
     /// Opens a new session with the specified trusted application.
@@ -87,12 +85,7 @@ impl Context {
     /// }
     /// ```
     pub fn open_session(&mut self, uuid: Uuid) -> Result<Session> {
-        Session::new(
-            self,
-            uuid,
-            ConnectionMethods::LoginPublic,
-            None::<&mut Operation<ParamNone, ParamNone, ParamNone, ParamNone>>,
-        )
+        self.open_session_with_login(uuid, ConnectionMethods::LoginPublic)
     }
 
     pub fn open_session_with_login(
@@ -142,7 +135,7 @@ impl Context {
 // Internal usage only
 impl Context {
     // anyone who wants to access the inner_context must take this as mut.
-    pub(crate) fn inner_context(&mut self) -> Rc<RefCell<InnerContext>> {
+    pub(crate) fn inner_context(&mut self) -> Arc<Mutex<InnerContext>> {
         self.raw.clone()
     }
 }

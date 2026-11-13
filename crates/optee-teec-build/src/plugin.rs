@@ -85,9 +85,7 @@ impl PluginConfig {
         )
         .to_string();
         let out_path = self.get_out_path();
-        if let Ok(v) = std::fs::read(&out_path)
-            && v.eq(codes.as_bytes())
-        {
+        if std::fs::read(&out_path).is_ok_and(|v| v == codes.as_bytes()) {
             return Ok(());
         }
 
@@ -104,15 +102,10 @@ impl PluginConfig {
     /// Uses the custom destination if set, otherwise defaults to
     /// `$OUT_DIR/plugin_static.rs`.
     fn get_out_path(&self) -> PathBuf {
-        match self.dest.as_ref() {
-            Some(v) => v.clone(),
-            None => {
-                let out_dir = PathBuf::from(
-                    std::env::var("OUT_DIR").expect("Infallible when using in build.rs"),
-                );
-                out_dir.join("plugin_static.rs")
-            }
-        }
+        self.dest.clone().unwrap_or_else(|| {
+            PathBuf::from(std::env::var("OUT_DIR").expect("Infallible when using in build.rs"))
+                .join("plugin_static.rs")
+        })
     }
 }
 
@@ -141,8 +134,8 @@ fn generate_binding(
                     timeHiAndVersion: #uuid_f3,
                     clockSeqAndNode: [#(#uuid_f4),*],
                 },
-                init: #init_fn_name,
-                invoke: #invoke_fn_name,
+                init: Some(#init_fn_name),
+                invoke: Some(#invoke_fn_name),
             };
         };
     }

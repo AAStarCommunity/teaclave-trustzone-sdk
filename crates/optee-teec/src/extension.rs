@@ -15,10 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::{
-    raw::size_t,
-    {ErrorKind, Result},
-};
+use crate::{ErrorKind, Result};
 use core::ffi::c_void;
 
 /// Parameters for a plugin invocation, carrying the command, sub-command,
@@ -49,7 +46,7 @@ pub struct PluginParameters<'a, 'b> {
     /// (meaning the caller does not expect output). When present,
     /// every output-writing method automatically updates this value,
     /// ensuring `out_len` is never left unset.
-    out_len: Option<&'b mut size_t>,
+    out_len: Option<&'b mut usize>,
 }
 
 impl<'a, 'b> PluginParameters<'a, 'b> {
@@ -68,8 +65,8 @@ impl<'a, 'b> PluginParameters<'a, 'b> {
         cmd: u32,
         sub_cmd: u32,
         buf: *mut c_void,
-        in_len: size_t,
-        out_len: *mut size_t,
+        in_len: usize,
+        out_len: *mut usize,
     ) -> Result<Self> {
         // Reject obviously invalid parameter combinations:
         // a non-zero in_len or a present out_len implies the caller expects
@@ -139,7 +136,8 @@ impl<'a, 'b> PluginParameters<'a, 'b> {
     /// Returns a mutable reference to the inout buffer.
     ///
     /// # Safety
-    /// The caller is responsible for updating `out_len` (via [`set_out_len`])
+    /// The caller is responsible for updating `out_len` (via
+    /// [`set_out_len`](Self::set_out_len))
     /// after writing to the buffer.
     pub unsafe fn get_buffer_mut(&mut self) -> &mut [u8] {
         self.buf
@@ -158,12 +156,8 @@ impl<'a, 'b> PluginParameters<'a, 'b> {
         if out_len > self.buf.len() {
             return Err(ErrorKind::BadParameters.into());
         }
-        match self.out_len.as_mut() {
-            None => Err(ErrorKind::BadState.into()),
-            Some(v) => {
-                **v = out_len;
-                Ok(())
-            }
-        }
+        let v = self.out_len.as_mut().ok_or(ErrorKind::BadState)?;
+        **v = out_len;
+        Ok(())
     }
 }

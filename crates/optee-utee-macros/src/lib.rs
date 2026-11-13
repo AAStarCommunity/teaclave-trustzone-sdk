@@ -27,7 +27,7 @@ use syn::spanned::Spanned;
 ///
 /// # Examples
 ///
-/// ``` no_run
+/// ``` ignore
 /// #[ta_create]
 /// fn ta_create() -> Result<()> { }
 /// ```
@@ -56,9 +56,9 @@ pub fn ta_create(_args: TokenStream, input: TokenStream) -> TokenStream {
 
     quote!(
         #[unsafe(no_mangle)]
-        pub extern "C" fn TA_CreateEntryPoint() -> optee_utee_sys::TEE_Result {
+        pub extern "C" fn TA_CreateEntryPoint() -> optee_utee::raw::TEE_Result {
             match #f_ident() {
-                Ok(_) => optee_utee_sys::TEE_SUCCESS,
+                Ok(_) => optee_utee::raw::TEE_SUCCESS,
                 Err(e) => e.raw_code()
             }
         }
@@ -72,7 +72,7 @@ pub fn ta_create(_args: TokenStream, input: TokenStream) -> TokenStream {
 ///
 /// # Examples
 ///
-/// ``` no_run
+/// ``` ignore
 /// #[ta_destroy]
 /// fn ta_destroy() { }
 /// ```
@@ -111,19 +111,44 @@ pub fn ta_destroy(_args: TokenStream, input: TokenStream) -> TokenStream {
     .into()
 }
 
-/// Attribute to declare the entry point of opening a session. Pointer to
-/// session context pointer (*mut *mut T) can be defined as an optional
-/// parameter.
+/// Attribute to declare the entry point of opening a session.
+///
+/// The `params` argument may be any type that implements
+/// `optee_utee::FromRawParameters` (`optee_utee::ParametersAny`, a 4-tuple
+/// of typed wrappers, `optee_utee::Parameters`, etc.)
+///
+/// A session context `&mut T` can be defined as an optional second parameter;
+/// `T` must implement `Default`.
 ///
 /// # Examples
 ///
-/// ``` no_run
+/// ```ignore
+/// // Old deprecated Parameters
 /// #[ta_open_session]
 /// fn open_session(params: &mut Parameters) -> Result<()> { }
 ///
-/// // T is the sess_ctx struct and is required to implement default trait
+/// // New typed parameters
+/// use optee_utee::prelude::*;
 /// #[ta_open_session]
-/// fn open_session(params: &mut Parameters, sess_ctx: &mut T) -> Result<()> { }
+/// fn open_session(params: &mut (
+///     ParameterNone,
+///     ParameterMemrefInput<'_>,
+///     ParameterValueOutput<'_>,
+///     ParameterMemrefOutput<'_>,
+/// )) -> Result<()> { }
+/// // use ParametersAny and check types with match later.
+/// #[ta_open_session]
+/// fn open_session(
+///     cmd_id: u32,
+///     params: &mut ParametersAny,
+/// ) -> Result<()> { }
+///
+/// // With session context
+/// #[ta_open_session]
+/// fn open_session(
+///     params: &mut Parameters,
+///     sess_ctx: &mut T,
+/// ) -> Result<()> { }
 /// ```
 #[proc_macro_attribute]
 pub fn ta_open_session(_args: TokenStream, input: TokenStream) -> TokenStream {
@@ -142,30 +167,47 @@ pub fn ta_open_session(_args: TokenStream, input: TokenStream) -> TokenStream {
     if !valid_signature {
         return syn::parse::Error::new(
             f.span(),
-            "`#[ta_open_session]` function must have signature `fn(&mut Parameters) -> Result<()>` or `fn(&mut Parameters, &mut T) -> Result<()>`",
+            "`#[ta_open_session]` function must have signature `fn(&mut P) -> Result<()>` or `fn(&mut P, &mut T) -> Result<()>`",
         )
         .to_compile_error()
         .into();
     }
 
     match f_sig.inputs.len() {
-        1 => quote!(
-            #[unsafe(no_mangle)]
-            pub extern "C" fn TA_OpenSessionEntryPoint(
-                param_types: optee_utee::RawParamTypes,
-                params: &mut optee_utee::RawParams,
-                _: *mut *mut core::ffi::c_void,
-            ) -> optee_utee_sys::TEE_Result {
-                let mut parameters = Parameters::from_raw(params, param_types);
-                match #f_ident(&mut parameters) {
-                    Ok(_) => optee_utee_sys::TEE_SUCCESS,
-                    Err(e) => e.raw_code()
+        1 => {
+            let tokens = quote!(
+                #[doc(hidden)]
+                trait __OpteeUteeSessionContext {
+                    type Context;
                 }
-            }
+                #[doc(hidden)]
+                struct __OpteeUteeSessionContextFromOpenSession;
+                impl __OpteeUteeSessionContext for __OpteeUteeSessionContextFromOpenSession {
+                    type Context = core::ffi::c_void;
+                }
 
-            #f
-        )
-        .into(),
+                #[unsafe(no_mangle)]
+                pub extern "C" fn TA_OpenSessionEntryPoint(
+                    param_types: optee_utee::RawParamTypes,
+                    params: &mut optee_utee::RawParams,
+                    _: *mut *mut core::ffi::c_void,
+                ) -> optee_utee::raw::TEE_Result {
+                    let mut parameters = match unsafe {
+                        optee_utee::FromRawParameters::from_raw(param_types, params)
+                    } {
+                        Ok(p) => p,
+                        Err(e) => return e.raw_code(),
+                    };
+                    match #f_ident(&mut parameters) {
+                        Ok(_) => optee_utee::raw::TEE_SUCCESS,
+                        Err(e) => e.raw_code()
+                    }
+                }
+
+                #f
+            );
+            tokens.into()
+        }
 
         2 => {
             let ctx_type = match extract_fn_arg_mut_ref_type(&f_sig.inputs[1]) {
@@ -174,21 +216,34 @@ pub fn ta_open_session(_args: TokenStream, input: TokenStream) -> TokenStream {
             };
 
             quote!(
-                // To eliminate the clippy error: this public function might dereference a raw pointer but is not marked `unsafe`
-                // we just expand the unsafe block, but the session-related macros need refactoring in the future
+                #[doc(hidden)]
+                trait __OpteeUteeSessionContext {
+                    type Context;
+                }
+                #[doc(hidden)]
+                struct __OpteeUteeSessionContextFromOpenSession;
+                impl __OpteeUteeSessionContext for __OpteeUteeSessionContextFromOpenSession {
+                    type Context = #ctx_type;
+                }
+
                 #[unsafe(no_mangle)]
                 pub unsafe extern "C" fn TA_OpenSessionEntryPoint(
                     param_types: optee_utee::RawParamTypes,
                     params: &mut optee_utee::RawParams,
                     sess_ctx: *mut *mut core::ffi::c_void,
-                ) -> optee_utee_sys::TEE_Result {
-                    let mut parameters = Parameters::from_raw(params, param_types);
+                ) -> optee_utee::raw::TEE_Result {
+                    let mut parameters = match unsafe {
+                        optee_utee::FromRawParameters::from_raw(param_types, params)
+                    } {
+                        Ok(p) => p,
+                        Err(e) => return e.raw_code(),
+                    };
                     let mut ctx: #ctx_type = Default::default();
                     match #f_ident(&mut parameters, &mut ctx) {
                         Ok(_) =>
                         {
-                            *sess_ctx = Box::into_raw(Box::new(ctx)) as _;
-                            optee_utee_sys::TEE_SUCCESS
+                            *sess_ctx = alloc::boxed::Box::into_raw(alloc::boxed::Box::new(ctx)) as _;
+                            optee_utee::raw::TEE_SUCCESS
                         }
                         Err(e) => e.raw_code()
                     }
@@ -207,7 +262,7 @@ pub fn ta_open_session(_args: TokenStream, input: TokenStream) -> TokenStream {
 ///
 /// # Examples
 ///
-/// ``` no_run
+/// ``` ignore
 /// #[ta_close_session]
 /// fn close_session(sess_ctx: &mut T) { }
 ///
@@ -240,6 +295,18 @@ pub fn ta_close_session(_args: TokenStream, input: TokenStream) -> TokenStream {
 
     match f_sig.inputs.len() {
         0 => quote!(
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            fn __optee_utee_close_session_context_type_must_match_ta_open_session() {
+                fn session_context_type_must_match_ta_open_session<T>()
+                where
+                    T: __OpteeUteeSessionContext<Context = core::ffi::c_void>,
+                {}
+                session_context_type_must_match_ta_open_session::<
+                    __OpteeUteeSessionContextFromOpenSession,
+                >();
+            }
+
             #[unsafe(no_mangle)]
             pub extern "C" fn TA_CloseSessionEntryPoint(_: *mut core::ffi::c_void) {
                 #f_ident()
@@ -255,6 +322,18 @@ pub fn ta_close_session(_args: TokenStream, input: TokenStream) -> TokenStream {
             };
 
             quote!(
+                #[doc(hidden)]
+                #[allow(dead_code)]
+                fn __optee_utee_close_session_context_type_must_match_ta_open_session() {
+                    fn session_context_type_must_match_ta_open_session<T>()
+                    where
+                        T: __OpteeUteeSessionContext<Context = #ctx_type>,
+                    {}
+                    session_context_type_must_match_ta_open_session::<
+                        __OpteeUteeSessionContextFromOpenSession,
+                    >();
+                }
+
                 // To eliminate the clippy error: this public function might dereference a raw pointer but is not marked `unsafe`
                 // we just expand the unsafe block, but the session-related macros need refactoring in the future
                 #[unsafe(no_mangle)]
@@ -262,7 +341,7 @@ pub fn ta_close_session(_args: TokenStream, input: TokenStream) -> TokenStream {
                     if sess_ctx.is_null() {
                         panic!("sess_ctx is null");
                     }
-                    let mut b = Box::from_raw(sess_ctx as *mut #ctx_type);
+                    let mut b = alloc::boxed::Box::from_raw(sess_ctx as *mut #ctx_type);
                     #f_ident(&mut b);
                     drop(b);
                 }
@@ -275,17 +354,49 @@ pub fn ta_close_session(_args: TokenStream, input: TokenStream) -> TokenStream {
     }
 }
 
-/// Attribute to declare the entry point of invoking commands. Session context
-/// reference (`&mut T`) can be defined as an optional parameter.
+/// Attribute to declare the entry point of invoking commands.
+///
+/// The `params` argument may be any type that implements
+/// `optee_utee::FromRawParameters` (`optee_utee::ParametersAny`, a 4-tuple
+/// of typed wrappers, `optee_utee::Parameters`, etc.)
+///
+/// A session context `&mut T` can be defined as an optional first parameter
+/// (before `cmd_id`).
 ///
 /// # Examples
 ///
-/// ``` no_run
-/// #[ta_invoke_command]
-/// fn invoke_command(sess_ctx: &mut T, cmd_id: u32, params: &mut Parameters) -> Result<()> { }
-///
+/// ```ignore
+/// // Old deprecated Parameters (no session context)
 /// #[ta_invoke_command]
 /// fn invoke_command(cmd_id: u32, params: &mut Parameters) -> Result<()> { }
+///
+/// // New typed parameters
+/// use optee_utee::prelude::*;
+///
+/// // 4-tuple of typed wrappers
+/// #[ta_invoke_command]
+/// fn invoke_command(
+///     cmd_id: u32,
+///     params: &mut (
+///         ParameterNone,
+///         ParameterMemrefInput<'_>,
+///         ParameterValueOutput<'_>,
+///         ParameterMemrefOutput<'_>,
+///     ),
+/// ) -> Result<()> { }
+/// // use ParametersAny and check types with match later.
+/// #[ta_invoke_command]
+/// fn invoke_command(
+///     cmd_id: u32,
+///     params: &mut ParametersAny,
+/// ) -> Result<()> { }
+/// // With session context
+/// #[ta_invoke_command]
+/// fn invoke_command(
+///     sess_ctx: &mut T,
+///     cmd_id: u32,
+///     params: &mut Parameters,
+/// ) -> Result<()> { }
 /// ```
 #[proc_macro_attribute]
 pub fn ta_invoke_command(_args: TokenStream, input: TokenStream) -> TokenStream {
@@ -304,33 +415,52 @@ pub fn ta_invoke_command(_args: TokenStream, input: TokenStream) -> TokenStream 
     if !valid_signature {
         return syn::parse::Error::new(
             f.span(),
-            "`#[ta_invoke_command]` function must have signature `fn(&mut T, u32, &mut Parameters) -> Result<()>` or `fn(u32, &mut Parameters) -> Result<()>`",
+            "`#[ta_invoke_command]` function must have signature `fn(u32, &mut P) -> Result<()>` or `fn(&mut T, u32, &mut P) -> Result<()>`",
         )
         .to_compile_error()
         .into();
     }
 
     match f_sig.inputs.len() {
-        2 => quote!(
-            #[unsafe(no_mangle)]
-            pub extern "C" fn TA_InvokeCommandEntryPoint(
-                _: *mut core::ffi::c_void,
-                cmd_id: u32,
-                param_types: u32,
-                params: &mut optee_utee::RawParams,
-            ) -> optee_utee_sys::TEE_Result {
-                let mut parameters = Parameters::from_raw(params, param_types);
-                match #f_ident(cmd_id, &mut parameters) {
-                    Ok(_) => {
-                        optee_utee_sys::TEE_SUCCESS
-                    },
-                    Err(e) => e.raw_code()
+        2 => {
+            let tokens = quote!(
+                #[doc(hidden)]
+                #[allow(dead_code)]
+                fn __optee_utee_invoke_session_context_type_must_match_ta_open_session() {
+                    fn session_context_type_must_match_ta_open_session<T>()
+                    where
+                        T: __OpteeUteeSessionContext<Context = core::ffi::c_void>,
+                    {}
+                    session_context_type_must_match_ta_open_session::<
+                        __OpteeUteeSessionContextFromOpenSession,
+                    >();
                 }
-            }
 
-            #f
-        )
-        .into(),
+                #[unsafe(no_mangle)]
+                pub extern "C" fn TA_InvokeCommandEntryPoint(
+                    _: *mut core::ffi::c_void,
+                    cmd_id: u32,
+                    param_types: optee_utee::RawParamTypes,
+                    params: &mut optee_utee::RawParams,
+                ) -> optee_utee::raw::TEE_Result {
+                    let mut parameters = match unsafe {
+                        optee_utee::FromRawParameters::from_raw(param_types, params)
+                    } {
+                        Ok(p) => p,
+                        Err(e) => return e.raw_code(),
+                    };
+                    match #f_ident(cmd_id, &mut parameters) {
+                        Ok(_) => {
+                            optee_utee::raw::TEE_SUCCESS
+                        },
+                        Err(e) => e.raw_code()
+                    }
+                }
+
+                #f
+            );
+            tokens.into()
+        }
         3 => {
             let ctx_type = match extract_fn_arg_mut_ref_type(&f_sig.inputs[0]) {
                 Ok(v) => v,
@@ -338,24 +468,39 @@ pub fn ta_invoke_command(_args: TokenStream, input: TokenStream) -> TokenStream 
             };
 
             quote!(
-                // To eliminate the clippy error: this public function might dereference a raw pointer but is not marked `unsafe`
-                // we just expand the unsafe block, but the session-related macros need refactoring in the future
+                #[doc(hidden)]
+                #[allow(dead_code)]
+                fn __optee_utee_invoke_session_context_type_must_match_ta_open_session() {
+                    fn session_context_type_must_match_ta_open_session<T>()
+                    where
+                        T: __OpteeUteeSessionContext<Context = #ctx_type>,
+                    {}
+                    session_context_type_must_match_ta_open_session::<
+                        __OpteeUteeSessionContextFromOpenSession,
+                    >();
+                }
+
                 #[unsafe(no_mangle)]
                 pub unsafe extern "C" fn TA_InvokeCommandEntryPoint(
                     sess_ctx: *mut core::ffi::c_void,
                     cmd_id: u32,
-                    param_types: u32,
+                    param_types: optee_utee::RawParamTypes,
                     params: &mut optee_utee::RawParams,
-                ) -> optee_utee_sys::TEE_Result {
+                ) -> optee_utee::raw::TEE_Result {
                     if sess_ctx.is_null() {
-                        return optee_utee_sys::TEE_ERROR_SECURITY;
+                        return optee_utee::raw::TEE_ERROR_SECURITY;
                     }
-                    let mut parameters = Parameters::from_raw(params, param_types);
-                    let mut b = Box::from_raw(sess_ctx as *mut #ctx_type);
+                    let mut parameters = match unsafe {
+                        optee_utee::FromRawParameters::from_raw(param_types, params)
+                    } {
+                        Ok(p) => p,
+                        Err(e) => return e.raw_code(),
+                    };
+                    let mut b = alloc::boxed::Box::from_raw(sess_ctx as *mut #ctx_type);
                     match #f_ident(&mut b, cmd_id, &mut parameters) {
                         Ok(_) => {
                             core::mem::forget(b);
-                            optee_utee_sys::TEE_SUCCESS
+                            optee_utee::raw::TEE_SUCCESS
                         },
                         Err(e) => {
                             core::mem::forget(b);

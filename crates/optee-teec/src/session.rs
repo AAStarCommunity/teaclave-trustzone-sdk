@@ -16,40 +16,71 @@
 // under the License.
 
 use super::context::InnerContext;
-use crate::{Context, Error, Operation, Param, Result, Uuid, raw};
-use std::{cell::RefCell, ptr, rc::Rc};
+use crate::{Context, Operation, Param, Result, Uuid, raw, teec_check_with_origin};
+use num_enum::{FromPrimitive, IntoPrimitive};
+use std::{
+    ptr,
+    sync::{Arc, Mutex},
+};
 
 /// Session login methods.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq, FromPrimitive, IntoPrimitive)]
+#[repr(u32)]
 pub enum ConnectionMethods {
     /// No login data is provided.
-    LoginPublic,
+    LoginPublic = raw::TEEC_LOGIN_PUBLIC,
     /// Login data about the user running the Client Application process is provided.
-    LoginUser,
+    LoginUser = raw::TEEC_LOGIN_USER,
     /// Login data about the group running the Client Application process is provided.
-    LoginGroup,
+    LoginGroup = raw::TEEC_LOGIN_GROUP,
     /// Login data about the running Client Application itself is provided.
-    LoginApplication,
+    LoginApplication = raw::TEEC_LOGIN_APPLICATION,
     /// Login data about the user and the running Client Application itself is provided.
-    LoginUserApplication,
+    LoginUserApplication = raw::TEEC_LOGIN_USER_APPLICATION,
     /// Login data about the group and the running Client Application itself is provided.
-    LoginGroupApplication,
+    LoginGroupApplication = raw::TEEC_LOGIN_GROUP_APPLICATION,
+    /// An unnamed or implementation-defined login type.
+    #[num_enum(catch_all)]
+    Unknown(u32),
+}
+
+/// An opaque, thread-movable OP-TEE session handle.
+///
+/// `raw::TEEC_Session` mirrors a C struct containing a `*mut`, so Rust cannot
+/// infer `Send`. libteec treats the handle as plain data: `TEEC_InvokeCommand`
+/// and `TEEC_CloseSession` read `session->imp.session_id` / `session->imp.ctx`
+/// and perform an ioctl, with no thread affinity (see `tee_client_api.c` in
+/// optee_client). The handle is kept opaque here; the binding does not rely on
+/// its layout.
+struct RawTeecSession(raw::TEEC_Session);
+
+// SAFETY: `RawTeecSession` is the sole owner of the handle and only ever hands
+// it out as `&mut` (see `get_mut`), so callers cannot alias it. Moving it
+// between threads is allowed by the libteec API contract: the handle is not
+// thread-affine, and the owning `Context` (which owns the underlying fd) is
+// kept alive separately by `Session::_ctx`. This assertion covers ownership
+// transfer only; it does not imply `Sync`, and `Session` is deliberately not
+// `Sync`.
+unsafe impl Send for RawTeecSession {}
+
+impl RawTeecSession {
+    fn new(raw: raw::TEEC_Session) -> Self {
+        Self(raw)
+    }
+
+    fn get_mut(&mut self) -> &mut raw::TEEC_Session {
+        &mut self.0
+    }
 }
 
 /// Represents a connection between a client application and a trusted application.
 pub struct Session {
-    raw: raw::TEEC_Session,
+    raw: RawTeecSession,
 
     // Just a holder to ensure InnerContext is not dropped and to eliminate the
     // lifetime constraint, never use it.
-    _ctx: Rc<RefCell<InnerContext>>,
+    _ctx: Arc<Mutex<InnerContext>>,
 }
-
-// Since raw::TEEC_Session contains a raw pointer, Rust does not automatically
-// implement Send and Sync for it. We need to manually implement them and ensure
-// that raw::TEEC_Session is used safely.
-unsafe impl Send for Session {}
-unsafe impl Sync for Session {}
 
 impl Session {
     /// Initializes a TEE session object with specified context and uuid.
@@ -66,31 +97,36 @@ impl Session {
         // block to maximize Rust's safety checks and leverage the compiler's
         // validation.
         let mut err_origin: u32 = 0;
-        let raw_operation = match operation {
-            Some(o) => o.as_mut_raw_ptr(),
-            None => ptr::null_mut(),
-        };
+        let raw_operation = operation.map_or(ptr::null_mut(), |o| o.as_mut_raw_ptr());
         let inner_ctx = context.inner_context();
-        let raw_ctx = &mut inner_ctx.borrow_mut().0;
+        let mut guard = match inner_ctx.lock() {
+            Ok(guard) => guard,
+            // A poisoned lock only records that another thread panicked while
+            // holding the context. The underlying `TEEC_Context` is still
+            // usable, so recover it rather than failing this unrelated call.
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let raw_ctx = &mut guard.0;
         let raw_uuid = uuid.as_raw_ptr();
 
-        match unsafe {
-            raw::TEEC_OpenSession(
-                raw_ctx,
-                &mut raw_session,
-                raw_uuid,
-                login as u32,
-                ptr::null(),
-                raw_operation,
-                &mut err_origin,
-            )
-        } {
-            raw::TEEC_SUCCESS => Ok(Self {
-                raw: raw_session,
-                _ctx: context.inner_context(),
-            }),
-            code => Err(Error::from_raw_error(code).with_origin(err_origin.into())),
-        }
+        teec_check_with_origin(
+            unsafe {
+                raw::TEEC_OpenSession(
+                    raw_ctx,
+                    &mut raw_session,
+                    raw_uuid,
+                    u32::from(login),
+                    ptr::null(),
+                    raw_operation,
+                    &mut err_origin,
+                )
+            },
+            err_origin,
+        )?;
+        Ok(Self {
+            raw: RawTeecSession::new(raw_session),
+            _ctx: context.inner_context(),
+        })
     }
 
     /// Invokes a command with an operation with this session.
@@ -100,24 +136,63 @@ impl Session {
         operation: &mut Operation<A, B, C, D>,
     ) -> Result<()> {
         let mut err_origin: u32 = 0;
-        match unsafe {
-            raw::TEEC_InvokeCommand(
-                &mut self.raw,
-                command_id,
-                operation.as_mut_raw_ptr(),
-                &mut err_origin,
-            )
-        } {
-            raw::TEEC_SUCCESS => Ok(()),
-            code => Err(Error::from_raw_error(code).with_origin(err_origin.into())),
-        }
+        teec_check_with_origin(
+            unsafe {
+                raw::TEEC_InvokeCommand(
+                    self.raw.get_mut(),
+                    command_id,
+                    operation.as_mut_raw_ptr(),
+                    &mut err_origin,
+                )
+            },
+            err_origin,
+        )
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
         unsafe {
-            raw::TEEC_CloseSession(&mut self.raw);
+            raw::TEEC_CloseSession(self.raw.get_mut());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionMethods;
+    use super::raw;
+
+    /// Guarantee: every `ConnectionMethods` variant converts to the matching
+    /// `TEEC_LOGIN_*` constant and the conversion round-trips through the
+    /// primitive login code, so a wrong discriminant can never be sent to
+    /// `TEEC_OpenSession`.
+    #[test]
+    fn connection_methods_round_trip_to_tee_constants() {
+        let cases = [
+            (ConnectionMethods::LoginPublic, raw::TEEC_LOGIN_PUBLIC),
+            (ConnectionMethods::LoginUser, raw::TEEC_LOGIN_USER),
+            (ConnectionMethods::LoginGroup, raw::TEEC_LOGIN_GROUP),
+            (
+                ConnectionMethods::LoginApplication,
+                raw::TEEC_LOGIN_APPLICATION,
+            ),
+            (
+                ConnectionMethods::LoginUserApplication,
+                raw::TEEC_LOGIN_USER_APPLICATION,
+            ),
+            (
+                ConnectionMethods::LoginGroupApplication,
+                raw::TEEC_LOGIN_GROUP_APPLICATION,
+            ),
+        ];
+
+        for (method, expected) in cases {
+            let code = u32::from(method);
+            assert_eq!(code, expected, "variant {method:?} has wrong TEEC code");
+
+            let round_tripped = ConnectionMethods::from(code);
+            assert_eq!(round_tripped, method);
         }
     }
 }
