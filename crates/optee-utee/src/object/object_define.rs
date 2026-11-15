@@ -39,6 +39,7 @@ impl From<Whence> for raw::TEE_Whence {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ObjectStorageConstants {
     Private = 0x00000001,
@@ -46,6 +47,13 @@ pub enum ObjectStorageConstants {
     PrivateRpmb = 0x80000100,
     IllegalValue = 0x7FFFFFFF,
 }
+
+// Pin storage IDs to OP-TEE's values (tee_api_defines_extensions.h) at compile
+// time. AAStar's old fork patch used 0x80000003 for RPMB, which OP-TEE rejects
+// with ITEM_NOT_FOUND; these asserts stop that class of regression.
+const _: () = assert!(ObjectStorageConstants::Private as u32 == 0x00000001);
+const _: () = assert!(ObjectStorageConstants::PrivateRee as u32 == 0x80000000);
+const _: () = assert!(ObjectStorageConstants::PrivateRpmb as u32 == 0x80000100);
 
 bitflags! {
     /// A set of flags that controls the access rights and sharing permissions

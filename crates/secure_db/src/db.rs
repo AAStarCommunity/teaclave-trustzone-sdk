@@ -16,58 +16,96 @@
 // under the License.
 
 use crate::{delete_from_secure_storage, load_from_secure_storage, save_in_secure_storage};
-use anyhow::{anyhow, ensure, Result};
+use anyhow::{bail, ensure, Result};
+use hashbrown::HashMap;
 use hashbrown::HashSet;
-use std::collections::HashMap;
+use optee_utee::ObjectStorageConstants;
 
 // SecureStorageDb is a key-value storage for TA to easily store and retrieve data.
 // First we store the key list in the secure storage, named as db_name.
 // Then we store the each key-value pairs in the secure storage.
+// The `storage` field selects the OP-TEE storage backend:
+//   - ObjectStorageConstants::Private  — REE-FS (/var/lib/tee/)
+//   - ObjectStorageConstants::PrivateRpmb     — eMMC RPMB (hardware-protected, anti-rollback)
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SecureStorageDb {
     name: String,
     key_list: HashSet<String>,
+    storage: ObjectStorageConstants,
 }
 
 impl SecureStorageDb {
     pub fn open(name: String) -> Result<Self> {
-        let key_list = match load_from_secure_storage(name.as_bytes())? {
-            Some(data) => bincode::deserialize(&data)?,
+        Self::open_with_storage(name, ObjectStorageConstants::Private)
+    }
+
+    pub fn open_rpmb(name: String) -> Result<Self> {
+        Self::open_with_storage(name, ObjectStorageConstants::PrivateRpmb)
+    }
+
+    pub fn open_with_storage(name: String, storage: ObjectStorageConstants) -> Result<Self> {
+        match load_from_secure_storage(storage, name.as_bytes())? {
+            Some(data) => {
+                let key_list = bincode::deserialize(&data)?;
+                Ok(Self {
+                    name,
+                    key_list,
+                    storage,
+                })
+            }
             None => {
                 // create new db
-                //
-                // Note: `std::collections::HashSet` was replaced with
-                // `hashbrown::HashSet`, due to a write permission fault
-                // observed during testing. The exact cause of the issue is
-                // unclear, but using `hashbrown::HashSet` resolves it.
-                HashSet::new()
+                Ok(Self {
+                    name,
+                    // Note: `std::collections::HashSet` was replaced with
+                    // `hashbrown::HashSet`, due to a write permission fault
+                    // observed during testing. The exact cause of the issue is
+                    // unclear, but using `hashbrown::HashSet` resolves it.
+                    key_list: HashSet::new(),
+                    storage,
+                })
             }
-        };
-        Ok(Self { name, key_list })
+        }
     }
 
     pub fn put(&mut self, key: String, value: Vec<u8>) -> Result<()> {
-        save_in_secure_storage(key.as_bytes(), &value)
-            .map_err(|e| anyhow!("[+] SecureStorage::insert(): save error: {}", e))?;
-        self.key_list.insert(key);
-        self.store_key_list()
+        match save_in_secure_storage(self.storage, key.as_bytes(), &value) {
+            Ok(_) => {
+                self.key_list.insert(key);
+                self.store_key_list()?;
+            }
+            Err(e) => {
+                bail!("[+] SecureStorage::insert(): save error: {}", e);
+            }
+        };
+        Ok(())
     }
 
     pub fn get(&self, key: &str) -> Result<Vec<u8>> {
         ensure!(self.key_list.contains(key), "Key not found in key list");
-        load_from_secure_storage(key.as_bytes())
-            .map_err(|e| anyhow!("[+] SecureStorage::get(): load error: {}", e))?
-            .ok_or_else(|| anyhow!("[+] SecureStorage::get(): object not found in db"))
+        match load_from_secure_storage(self.storage, key.as_bytes()) {
+            Ok(Some(data)) => Ok(data),
+            Ok(None) => bail!("[+] SecureStorage::get(): object not found in db"),
+            Err(e) => {
+                bail!("[+] SecureStorage::get(): load error: {}", e);
+            }
+        }
     }
 
     pub fn delete(&mut self, key: &str) -> Result<()> {
         // ensure key must exist
         ensure!(self.key_list.contains(key), "Key not found in key list");
-        delete_from_secure_storage(key.as_bytes())
-            .map_err(|e| anyhow!("[+] SecureStorage::delete(): delete error: {}", e))?;
-        self.key_list.remove(key);
-        self.store_key_list()
+        match delete_from_secure_storage(self.storage, key.as_bytes()) {
+            Ok(_) => {
+                self.key_list.remove(key);
+                self.store_key_list()?;
+            }
+            Err(e) => {
+                bail!("[+] SecureStorage::delete(): delete error: {}", e);
+            }
+        };
+        Ok(())
     }
 
     pub fn clear(&mut self) -> Result<()> {
@@ -88,9 +126,25 @@ impl SecureStorageDb {
         Ok(result)
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.key_list.is_empty()
+    }
+
+    /// Count keys matching a prefix WITHOUT reading any object data.
+    /// The key list is already in memory, so this issues zero secure-storage
+    /// read syscalls — important inside a TA where each storage syscall can
+    /// corrupt the TLS register (tpidr_el0). Use this instead of
+    /// list_entries_with_prefix(..).len() when only the count is needed.
+    pub fn count_keys_with_prefix(&self, prefix: &str) -> usize {
+        self.key_list
+            .iter()
+            .filter(|k| k.starts_with(prefix))
+            .count()
+    }
+
     fn store_key_list(&self) -> Result<()> {
         let key_list = bincode::serialize(&self.key_list)?;
-        save_in_secure_storage(self.name.as_bytes(), &key_list)?;
+        save_in_secure_storage(self.storage, self.name.as_bytes(), &key_list)?;
         Ok(())
     }
 }
