@@ -15,12 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use aligned_vec::{AVec, ConstAlign};
 use alloc::{boxed::Box, vec::Vec};
 use core::{mem, ptr};
 
 use optee_utee_sys as raw;
 
-use crate::{Attribute, Error, GenericObject, Result, TransientObject};
+use crate::{Attribute, ErrorKind, GenericObject, Result, TransientObject, tee_check};
 
 /// Specify one of the available cryptographic operations.
 #[repr(u32)]
@@ -115,47 +116,100 @@ pub enum OperationConstant {
     KeyDerivation = 8,
 }
 
-/// Represent the information about a crypto information which uses multiple keys.
+const HEADER_SIZE: usize = mem::size_of::<raw::TEE_OperationInfoMultiple>();
+const KEY_SIZE: usize = mem::size_of::<raw::TEE_OperationInfoKey>();
+const HEADER_ALIGN: usize = mem::align_of::<raw::TEE_OperationInfoMultiple>();
+
+/// The characteristics of a cryptographic operation that may use multiple keys.
+///
+/// This type owns its C-layout buffer.
+///
+/// # Migration
+///
+/// - `info_multiple(&mut [u8])` keeps its signature and now returns an owned
+///   value.
+/// - `from_raw(ptr, size)` is now [`from_buffer`](Self::from_buffer); convert
+///   the C pointer to a byte slice first.
+/// - `raw()` now returns a header reference.
+/// - `size()` can be derived from `raw().numberOfKeys` and the C layout sizes.
 pub struct OperationInfoMultiple {
-    raw: *mut raw::TEE_OperationInfoMultiple,
-    size: usize,
+    storage: AVec<u8, ConstAlign<HEADER_ALIGN>>,
 }
 
 impl OperationInfoMultiple {
-    /// Return the `OperationInfoMultiple` struct based on the raw struct `TEE_OperationInfo`.
+    /// Copy the operation information out of an already filled buffer.
     ///
-    /// The raw structure contains following fields:
+    /// The first bytes are interpreted as a `TEE_OperationInfoMultiple`
+    /// header and the bytes after it as `numberOfKeys` key entries. The buffer
+    /// must be at least `size_of::<TEE_OperationInfoMultiple>()` bytes and
+    /// aligned to `align_of::<TEE_OperationInfoMultiple>()` (currently 32 and
+    /// 4 bytes).
     ///
-    /// 1) `algorithm`: One of the algorithm of [AlgorithmId](AlgorithmId).
-    /// 2) `mode`: One of the mode of [OperationMode](OperationMode).
-    /// 3) `maxKeySize`: The maximum key sizes of different algorithms as defined in
-    ///    [TransientObjectType](../object/enum.TransientObjectType.html).
-    /// 4) `operationClass`: One of the constants from [OperationConstant](OperationConstant).
-    /// 5) `digestLength`: For a [Mac](Mac), [AE](AE), or [Digest](Digest), describes the number of bytes in the digest or tag.
-    /// 6) `handleState`: A bit vector describing the current state of the operation. Contains one or more of the
-    ///    [HandleFlag](../object/struct.HandleFlag.html).
-    /// 7) `operationState`: Every operation has two states which are defined as
-    ///    [OperationStates](OperationStates).
-    /// 8) `numberOfKeys`: This is set to the number of keys required by this operation. May be 0 for an operation which requires no keys.
-    /// 9) `keyInformation`: This array contains numberOfKeys entries, each of which defines the details for one key used by the operation,
-    ///    in the order they are defined.
-    ///    If the buffer is larger than required to support `numberOfKeys` entries, the additional space is not initialized or modified.
-    ///    For each element:
-    ///    9.1) `keySize`: If a key is programmed in the operation, the actual size of this key, otherwise 0.
-    ///    9.2) `requiredKeyUsage`: A bit vector that describes the necessary bits in the object usage for `set_key` or `set_key_2` to succeed without panicking.
-    pub fn from_raw(raw: *mut raw::TEE_OperationInfoMultiple, size: usize) -> Self {
-        Self { raw, size }
+    /// # Errors
+    ///
+    /// 1) `BadParameters`: If the buffer is too small, misaligned, or reports
+    ///    a `numberOfKeys` that does not fit in the buffer.
+    /// 2) `OutOfMemory`: If the owned buffer cannot be allocated.
+    pub fn from_buffer(info_buf: &[u8]) -> Result<Self> {
+        check_info_multiple_buffer(info_buf)?;
+
+        // SAFETY: the buffer is aligned and large enough for the header.
+        let header = unsafe { &*info_buf.as_ptr().cast::<raw::TEE_OperationInfoMultiple>() };
+        let size = checked_encoded_size(header.numberOfKeys as usize)
+            .filter(|&size| size <= info_buf.len())
+            .ok_or(ErrorKind::BadParameters)?;
+
+        let mut storage = allocate_storage(size)?;
+        storage.as_mut_slice().copy_from_slice(&info_buf[..size]);
+        Ok(Self { storage })
     }
 
-    /// Return the raw struct `TEE_OperationInfoMultiple`.
-    pub fn raw(&self) -> *mut raw::TEE_OperationInfoMultiple {
-        self.raw
+    /// Return the raw header.
+    ///
+    /// The C flexible array member is not part of this reference; use
+    /// [`keys`](Self::keys) to access it.
+    pub fn raw(&self) -> &raw::TEE_OperationInfoMultiple {
+        // SAFETY: storage is aligned and contains a valid header.
+        unsafe { &*self.storage.as_ptr().cast() }
     }
 
-    /// Return the `size` field of the raw structure `TEE_OperationInfoMultiple`.
-    pub fn size(&self) -> usize {
-        self.size
+    /// Return the key information.
+    pub fn keys(&self) -> &[raw::TEE_OperationInfoKey] {
+        let number_of_keys = self.raw().numberOfKeys as usize;
+
+        // SAFETY: constructors validate `numberOfKeys` against capacity.
+        // The pointer is derived from the whole buffer, so its provenance
+        // covers the trailing keys.
+        unsafe {
+            core::slice::from_raw_parts(
+                self.storage
+                    .as_ptr()
+                    .add(HEADER_SIZE)
+                    .cast::<raw::TEE_OperationInfoKey>(),
+                number_of_keys,
+            )
+        }
     }
+}
+
+fn checked_encoded_size(number_of_keys: usize) -> Option<usize> {
+    HEADER_SIZE.checked_add(number_of_keys.checked_mul(KEY_SIZE)?)
+}
+
+fn allocate_storage(size: usize) -> Result<AVec<u8, ConstAlign<HEADER_ALIGN>>> {
+    let mut storage = AVec::<u8, ConstAlign<HEADER_ALIGN>>::new(HEADER_ALIGN);
+    storage
+        .try_reserve_exact(size)
+        .map_err(|_| ErrorKind::OutOfMemory)?;
+    storage.resize(size, 0);
+    Ok(storage)
+}
+
+fn check_info_multiple_buffer(info_buf: &[u8]) -> Result<()> {
+    if info_buf.len() < HEADER_SIZE || !(info_buf.as_ptr() as usize).is_multiple_of(HEADER_ALIGN) {
+        return Err(ErrorKind::BadParameters.into());
+    }
+    Ok(())
 }
 
 /// An opaque reference that identifies a particular cryptographic operation.
@@ -178,17 +232,15 @@ impl OperationHandle {
 
     fn allocate(algo: AlgorithmId, mode: OperationMode, max_key_size: usize) -> Result<Self> {
         let raw_handle: *mut raw::TEE_OperationHandle = Box::into_raw(Box::new(ptr::null_mut()));
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_AllocateOperation(
                 raw_handle as *mut _,
                 algo as u32,
                 mode as u32,
                 max_key_size as u32,
             )
-        } {
-            raw::TEE_SUCCESS => Ok(Self::from_raw(raw_handle)),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })?;
+        Ok(Self::from_raw(raw_handle))
     }
 
     fn info(&self) -> OperationInfo {
@@ -198,16 +250,18 @@ impl OperationHandle {
     }
 
     fn info_multiple(&self, info_buf: &mut [u8]) -> Result<OperationInfoMultiple> {
-        let mut tmp_size: usize = 0;
-        match unsafe {
-            raw::TEE_GetOperationInfoMultiple(self.handle(), info_buf.as_ptr() as _, &mut tmp_size)
-        } {
-            raw::TEE_SUCCESS => Ok(OperationInfoMultiple::from_raw(
-                info_buf.as_ptr() as _,
-                tmp_size,
-            )),
-            code => Err(Error::from_raw_error(code)),
-        }
+        check_info_multiple_buffer(info_buf)?;
+
+        let mut size = info_buf.len();
+        tee_check(unsafe {
+            raw::TEE_GetOperationInfoMultiple(
+                self.handle(),
+                info_buf.as_mut_ptr().cast(),
+                &mut size,
+            )
+        })?;
+
+        OperationInfoMultiple::from_buffer(info_buf)
     }
 
     fn reset(&mut self) {
@@ -217,10 +271,7 @@ impl OperationHandle {
     }
 
     fn set_key<T: GenericObject>(&self, object: &T) -> Result<()> {
-        match unsafe { raw::TEE_SetOperationKey(self.handle(), *object.as_raw_ref()) } {
-            raw::TEE_SUCCESS => Ok(()),
-            code => Err(Error::from_raw_error(code)),
-        }
+        tee_check(unsafe { raw::TEE_SetOperationKey(self.handle(), *object.as_raw_ref()) })
     }
 
     fn set_key_2<T: GenericObject, D: GenericObject>(
@@ -228,12 +279,9 @@ impl OperationHandle {
         object1: &T,
         object2: &D,
     ) -> Result<()> {
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_SetOperationKey2(self.handle(), *object1.as_raw_ref(), *object2.as_raw_ref())
-        } {
-            raw::TEE_SUCCESS => Ok(()),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })
     }
 
     fn copy<T: OpHandle>(&mut self, src: &T) {
@@ -245,10 +293,7 @@ impl OperationHandle {
 
 /// determine whether a combination of algId and element is supported
 pub fn is_algorithm_supported(alg_id: u32, element: u32) -> Result<()> {
-    match unsafe { raw::TEE_IsAlgorithmSupported(alg_id, element) } {
-        raw::TEE_SUCCESS => Ok(()),
-        code => Err(Error::from_raw_error(code)),
-    }
+    tee_check(unsafe { raw::TEE_IsAlgorithmSupported(alg_id, element) })
 }
 
 // free before check it's not null
@@ -343,7 +388,7 @@ impl Digest {
     //hash size is dynamic changed so we returned it's updated size
     pub fn do_final(&self, chunk: &[u8], hash: &mut [u8]) -> Result<usize> {
         let mut hash_size: usize = hash.len();
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_DigestDoFinal(
                 self.handle(),
                 chunk.as_ptr() as _,
@@ -351,10 +396,8 @@ impl Digest {
                 hash.as_mut_ptr() as _,
                 &mut hash_size,
             )
-        } {
-            raw::TEE_SUCCESS => Ok(hash_size),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })?;
+        Ok(hash_size)
     }
 
     /// Create a Digest operation without any specific algorithm or other data.
@@ -428,47 +471,39 @@ impl Digest {
         self.0.info()
     }
 
-    /// Return the characteristics of a Digest operation with multiple keys.
+    /// Return the characteristics of an operation which may use multiple keys.
     ///
-    /// # Parameters
-    ///
-    /// 1) `info_buf`: The buffer is supposed to save multiple keys, and its size should be large enough before passed in.
-    ///    The number of keys about this operation can be calculated as: OperationInfoMultiple::size -
-    ///    size_of([OperationInfoMultiple](OperationInfoMultiple)) / size_of ( raw::TEE_OperationInfoKey)+1.
+    /// `info_buf` must be at least `size_of::<TEE_OperationInfoMultiple>()`
+    /// bytes and aligned to `align_of::<TEE_OperationInfoMultiple>()`. OP-TEE
+    /// currently reports at most two keys, so a 48-byte buffer is sufficient;
+    /// the result is copied into an owned value.
     ///
     /// # Example
     ///
     /// ``` rust,no_run
     /// # use optee_utee::{Digest, AlgorithmId};
     /// # fn main() -> optee_utee::Result<()> {
-    /// match Digest::allocate(AlgorithmId::Md5) {
-    ///     Ok(operation) =>
-    ///     {
-    ///         let mut buffer = [0u8, 12];
-    ///         match operation.info_multiple(&mut buffer) {
-    ///             Ok(info_multiple) => {
-    ///                 // ...
-    ///                 Ok(())
-    ///             }
-    ///             Err(e) => Err(e),
-    ///         }
-    ///     }
-    ///     Err(e) => Err(e),
-    /// }
+    /// #[repr(align(4))]
+    /// struct AlignedBuffer([u8; 48]);
+    ///
+    /// let operation = Digest::allocate(AlgorithmId::Md5)?;
+    /// let mut buffer = AlignedBuffer([0; 48]);
+    /// let info = operation.info_multiple(&mut buffer.0)?;
+    /// # let _ = info;
+    /// # Ok(())
     /// # }
     /// ```
     ///
-    /// # Errors:
+    /// # Errors
     ///
-    /// 1) `ShortBuffer`: If the `info_buf` is not large enough to hold an
-    ///    [OperationInfoMultiple](OperationInfoMultiple) and the corresponding keys.
+    /// 1) `BadParameters`: If `info_buf` is too small or not 4-byte aligned.
+    /// 2) `ShortBuffer`: If `info_buf` cannot hold the reported keys.
+    /// 3) `OutOfMemory`: If the owned copy cannot be allocated.
     ///
-    /// # Panics:
+    /// # Panics
     ///
     /// 1) If operation is not a valid opened object.
     /// 2) If the Implementation detects any other error.
-    // Here the multiple info total size is not sure
-    // Passed in array is supposed to provide enough size for this struct
     pub fn info_multiple(&self, info_buf: &mut [u8]) -> Result<OperationInfoMultiple> {
         self.0.info_multiple(info_buf)
     }
@@ -628,7 +663,7 @@ impl Cipher {
     /// 4) If the Implementation detects any other error.
     pub fn update(&self, src: &[u8], dest: &mut [u8]) -> Result<usize> {
         let mut dest_size: usize = dest.len();
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_CipherUpdate(
                 self.handle(),
                 src.as_ptr() as _,
@@ -636,10 +671,8 @@ impl Cipher {
                 dest.as_mut_ptr() as _,
                 &mut dest_size,
             )
-        } {
-            raw::TEE_SUCCESS => Ok(dest_size),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })?;
+        Ok(dest_size)
     }
 
     /// Finalize the cipher operation, processing data that has not been processed by previous calls
@@ -662,7 +695,7 @@ impl Cipher {
     /// 4) If the Implementation detects any other error.
     pub fn do_final(&self, src: &[u8], dest: &mut [u8]) -> Result<usize> {
         let mut dest_size: usize = dest.len();
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_CipherDoFinal(
                 self.handle(),
                 src.as_ptr() as _,
@@ -670,10 +703,8 @@ impl Cipher {
                 dest.as_mut_ptr() as _,
                 &mut dest_size,
             )
-        } {
-            raw::TEE_SUCCESS => Ok(dest_size),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })?;
+        Ok(dest_size)
     }
 
     /// Create a Cipher operation without any specific algorithm or other data.
@@ -882,7 +913,7 @@ impl Mac {
     /// 5) If the Implementation detects any other error.
     pub fn compute_final(&self, message: &[u8], mac: &mut [u8]) -> Result<usize> {
         let mut mac_size: usize = mac.len();
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_MACComputeFinal(
                 self.handle(),
                 message.as_ptr() as _,
@@ -890,10 +921,8 @@ impl Mac {
                 mac.as_mut_ptr() as _,
                 &mut mac_size,
             )
-        } {
-            raw::TEE_SUCCESS => Ok(mac_size),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })?;
+        Ok(mac_size)
     }
 
     /// Finalize the MAC operation and compares the MAC with the buffer passed to the function.
@@ -917,7 +946,7 @@ impl Mac {
     /// 4) Hardware or cryptographic algorithm failure.
     /// 5) If the Implementation detects any other error.
     pub fn compare_final(&self, message: &[u8], mac: &[u8]) -> Result<()> {
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_MACCompareFinal(
                 self.handle(),
                 message.as_ptr() as _,
@@ -925,10 +954,7 @@ impl Mac {
                 mac.as_ptr() as _,
                 mac.len(),
             )
-        } {
-            raw::TEE_SUCCESS => Ok(()),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })
     }
 
     /// Create a Mac operation without any specific algorithm or other data.
@@ -1011,7 +1037,7 @@ impl AE {
         aad_len: usize,
         pay_load_len: usize,
     ) -> Result<()> {
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_AEInit(
                 self.handle(),
                 nonce.as_ptr() as _,
@@ -1020,10 +1046,7 @@ impl AE {
                 aad_len,
                 pay_load_len,
             )
-        } {
-            raw::TEE_SUCCESS => Ok(()),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })
     }
 
     /// Feed a new chunk of Additional Authentication Data (AAD) to the AE operation.
@@ -1071,7 +1094,7 @@ impl AE {
     /// 6) If the Implementation detects any other error.
     pub fn update(&self, src: &[u8], dest: &mut [u8]) -> Result<usize> {
         let mut dest_size: usize = dest.len();
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_AEUpdate(
                 self.handle(),
                 src.as_ptr() as _,
@@ -1079,10 +1102,8 @@ impl AE {
                 dest.as_mut_ptr() as _,
                 &mut dest_size,
             )
-        } {
-            raw::TEE_SUCCESS => Ok(dest_size),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })?;
+        Ok(dest_size)
     }
     /// Process data that has not been processed by previous calls to [update](AE::update) as well as data supplied in `src`.
     /// It completes the AE operation and computes the tag.
@@ -1155,7 +1176,7 @@ impl AE {
     ) -> Result<(usize, usize)> {
         let mut dest_size: usize = dest.len();
         let mut tag_size: usize = tag.len();
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_AEEncryptFinal(
                 self.handle(),
                 src.as_ptr() as _,
@@ -1165,10 +1186,8 @@ impl AE {
                 tag.as_mut_ptr() as _,
                 &mut tag_size,
             )
-        } {
-            raw::TEE_SUCCESS => Ok((dest_size, tag_size)),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })?;
+        Ok((dest_size, tag_size))
     }
 
     /// Process data that has not been processed by previous calls to [update](AE::update) as well as data supplied in `src`.
@@ -1196,7 +1215,7 @@ impl AE {
     /// 5) If the Implementation detects any other error.
     pub fn decrypt_final(&self, src: &[u8], dest: &mut [u8], tag: &[u8]) -> Result<usize> {
         let mut dest_size: usize = dest.len();
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_AEDecryptFinal(
                 self.handle(),
                 src.as_ptr() as _,
@@ -1206,10 +1225,8 @@ impl AE {
                 tag.as_ptr() as _,
                 tag.len(),
             )
-        } {
-            raw::TEE_SUCCESS => Ok(dest_size),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })?;
+        Ok(dest_size)
     }
 
     /// Create an AE operation without any specific algorithm or other data.
@@ -1283,7 +1300,7 @@ impl Asymmetric {
     ///             AlgorithmId::RsaesPkcs1V15,
     ///             OperationMode::Encrypt,
     ///             256) {
-    ///             Ok(operation) => {
+    ///             Ok(mut operation) => {
     ///                 operation.set_key(&key)?;
     ///                 match operation.encrypt(&[], &clear) {
     ///                     Ok(ciph_text) => {
@@ -1322,7 +1339,7 @@ impl Asymmetric {
         let p: Vec<raw::TEE_Attribute> = params.iter().map(|p| p.raw()).collect();
         let mut res_size: usize = self.info().key_size() as usize;
         let mut res_vec: Vec<u8> = vec![0u8; res_size];
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_AsymmetricEncrypt(
                 self.handle(),
                 p.as_ptr() as _,
@@ -1332,13 +1349,9 @@ impl Asymmetric {
                 res_vec.as_mut_ptr() as _,
                 &mut res_size,
             )
-        } {
-            raw::TEE_SUCCESS => {
-                res_vec.truncate(res_size);
-                Ok(res_vec)
-            }
-            code => Err(Error::from_raw_error(code)),
-        }
+        })?;
+        res_vec.truncate(res_size);
+        Ok(res_vec)
     }
 
     /// Decrypt a message.
@@ -1365,7 +1378,7 @@ impl Asymmetric {
         let p: Vec<raw::TEE_Attribute> = params.iter().map(|p| p.raw()).collect();
         let mut res_size: usize = self.info().key_size() as usize;
         let mut res_vec: Vec<u8> = vec![0u8; res_size];
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_AsymmetricDecrypt(
                 self.handle(),
                 p.as_ptr() as _,
@@ -1375,13 +1388,9 @@ impl Asymmetric {
                 res_vec.as_mut_ptr() as _,
                 &mut res_size,
             )
-        } {
-            raw::TEE_SUCCESS => {
-                res_vec.truncate(res_size);
-                Ok(res_vec)
-            }
-            code => Err(Error::from_raw_error(code)),
-        }
+        })?;
+        res_vec.truncate(res_size);
+        Ok(res_vec)
     }
 
     /// Sign a message digest.
@@ -1413,7 +1422,7 @@ impl Asymmetric {
     ) -> Result<usize> {
         let p: Vec<raw::TEE_Attribute> = params.iter().map(|p| p.raw()).collect();
         let mut signature_size: usize = signature.len();
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_AsymmetricSignDigest(
                 self.handle(),
                 p.as_ptr() as _,
@@ -1423,10 +1432,8 @@ impl Asymmetric {
                 signature.as_mut_ptr() as _,
                 &mut signature_size,
             )
-        } {
-            raw::TEE_SUCCESS => Ok(signature_size),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })?;
+        Ok(signature_size)
     }
 
     /// Verify a message digest.
@@ -1457,7 +1464,7 @@ impl Asymmetric {
         signature: &[u8],
     ) -> Result<()> {
         let p: Vec<raw::TEE_Attribute> = params.iter().map(|p| p.raw()).collect();
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_AsymmetricVerifyDigest(
                 self.handle(),
                 p.as_ptr() as _,
@@ -1467,10 +1474,7 @@ impl Asymmetric {
                 signature.as_ptr() as _,
                 signature.len(),
             )
-        } {
-            raw::TEE_SUCCESS => Ok(()),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })
     }
 
     /// Create an Asymmetric operation without any specific algorithm or other data.
@@ -1497,7 +1501,7 @@ impl Asymmetric {
     }
 
     /// Function usage is similar to [Cipher::set_key](Cipher::set_key).
-    pub fn set_key<T: GenericObject>(&self, object: &T) -> Result<()> {
+    pub fn set_key<T: GenericObject>(&mut self, object: &T) -> Result<()> {
         self.0.set_key(object)
     }
 
@@ -1517,14 +1521,19 @@ impl OpHandle for Asymmetric {
 pub struct DeriveKey(OperationHandle);
 
 impl DeriveKey {
-    /// Take one of the Asymmetric Derivation Operation Algorithm that supports this operation as
+    /// Take one of the key derivation algorithms that supports this operation as
     /// defined in [AlgorithmId](AlgorithmId), and output a key object.
     ///
     /// # Parameters
     ///
     /// 1) `params`: For algorithm [DhDeriveSharedSecret][AlgorithmId::DhDeriveSharedSecret],
     ///    [DhPublicValue](../object/enum.AttributeId.html#variant.DhPublicValue) is required as
-    ///    the passed in attribute.
+    ///    the passed in attribute. For the PBKDF2-HMAC algorithms
+    ///    ([Pbkdf2HmacSha1][AlgorithmId::Pbkdf2HmacSha1] and similar), pass the
+    ///    salt, the iteration count and the derived key material length as
+    ///    attributes, and use a
+    ///    [Pbkdf2Password](crate::TransientObjectType::Pbkdf2Password) object
+    ///    as the operation key.
     /// 2) `object`: An uninitialized transient object to be filled with the derived key.
     ///
     /// # Example
@@ -1556,7 +1565,7 @@ impl DeriveKey {
     ///     Ok(key_pair_2) => {
     ///         key_pair_2.generate_key(256, &[attr_prime.into(), attr_base.into()])?;
     ///         match DeriveKey::allocate(AlgorithmId::DhDeriveSharedSecret, 256) {
-    ///             Ok(operation) => {
+    ///             Ok(mut operation) => {
     ///                 operation.set_key(&key_pair_2)?;
     ///                 match TransientObject::allocate(TransientObjectType::GenericSecret, 256) {
     ///                     // Derived key is saved as an transient object
@@ -1602,7 +1611,9 @@ impl DeriveKey {
     }
 
     /// Function usage is similar to [Digest::allocate](Digest::allocate).
-    /// Currently only supports [DhDeriveSharedSecret][AlgorithmId::DhDeriveSharedSecret] as
+    /// Currently supports [DhDeriveSharedSecret][AlgorithmId::DhDeriveSharedSecret],
+    /// [EcDhDeriveSharedSecret][AlgorithmId::EcDhDeriveSharedSecret],
+    /// [X25519][AlgorithmId::X25519] and the PBKDF2-HMAC algorithms as
     /// `algo`.
     pub fn allocate(algo: AlgorithmId, max_key_size: usize) -> Result<Self> {
         match OperationHandle::allocate(algo, OperationMode::Derive, max_key_size) {
@@ -1622,7 +1633,7 @@ impl DeriveKey {
     }
 
     /// Function usage is similar to [Cipher::set_key](Cipher::set_key).
-    pub fn set_key<T: GenericObject>(&self, object: &T) -> Result<()> {
+    pub fn set_key<T: GenericObject>(&mut self, object: &T) -> Result<()> {
         self.0.set_key(object)
     }
 
@@ -1677,6 +1688,7 @@ impl Random {
 }
 
 /// Algorithms that can be allocated as an crypto operation.
+#[derive(Clone, Copy, strum::Display)]
 #[repr(u32)]
 pub enum AlgorithmId {
     /// [Cipher](Cipher) supported algorithm.
@@ -1794,6 +1806,18 @@ pub enum AlgorithmId {
     DhDeriveSharedSecret = 0x80000032,
     /// [DeriveKey](DeriveKey) supported algorithm.
     EcDhDeriveSharedSecret = 0x80000042,
+    /// [DeriveKey](DeriveKey) supported algorithm, PBKDF2 with HMAC-SHA1.
+    Pbkdf2HmacSha1 = 0x800020C2,
+    /// [DeriveKey](DeriveKey) supported algorithm, PBKDF2 with HMAC-SHA224.
+    Pbkdf2HmacSha224 = 0x800030C2,
+    /// [DeriveKey](DeriveKey) supported algorithm, PBKDF2 with HMAC-SHA256.
+    Pbkdf2HmacSha256 = 0x800040C2,
+    /// [DeriveKey](DeriveKey) supported algorithm, PBKDF2 with HMAC-SHA384.
+    Pbkdf2HmacSha384 = 0x800050C2,
+    /// [DeriveKey](DeriveKey) supported algorithm, PBKDF2 with HMAC-SHA512.
+    Pbkdf2HmacSha512 = 0x800060C2,
+    /// [DeriveKey](DeriveKey) supported algorithm, PBKDF2 with HMAC-SM3.
+    Pbkdf2HmacSm3 = 0x800070C2,
     /// [Asymmetric](Asymmetric) supported algorithm, can be applied with
     /// [Sign](OperationMode::Sign) or [Verify](OperationMode::Verify) mode.
     EcDsaSha1 = 0x70001042,
@@ -1862,4 +1886,216 @@ pub enum ElementId {
     EccCurveNistP521 = 0x00000005,
     /// Source: `IETF`, Generic: `N`, Size: 256 bits
     EccCurve25519 = 0x00000300,
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use super::*;
+    use crate::{AttributeId, TransientObjectType};
+    use optee_utee_sys::{mock_api, mock_utils::SERIAL_TEST_LOCK};
+
+    #[test]
+    // Guarantee: every high-level PBKDF2 `AlgorithmId` variant maps 1:1
+    // to the OP-TEE raw constant from `tee_api_defines_extensions.h`,
+    // so `DeriveKey::allocate` passes the correct algorithm ID to
+    // `TEE_AllocateOperation`.
+    fn pbkdf2_algorithm_ids_match_raw_constants() {
+        let cases = [
+            (
+                AlgorithmId::Pbkdf2HmacSha1,
+                raw::TEE_ALG_PBKDF2_HMAC_SHA1_DERIVE_KEY,
+            ),
+            (
+                AlgorithmId::Pbkdf2HmacSha224,
+                raw::TEE_ALG_PBKDF2_HMAC_SHA224_DERIVE_KEY,
+            ),
+            (
+                AlgorithmId::Pbkdf2HmacSha256,
+                raw::TEE_ALG_PBKDF2_HMAC_SHA256_DERIVE_KEY,
+            ),
+            (
+                AlgorithmId::Pbkdf2HmacSha384,
+                raw::TEE_ALG_PBKDF2_HMAC_SHA384_DERIVE_KEY,
+            ),
+            (
+                AlgorithmId::Pbkdf2HmacSha512,
+                raw::TEE_ALG_PBKDF2_HMAC_SHA512_DERIVE_KEY,
+            ),
+            (
+                AlgorithmId::Pbkdf2HmacSm3,
+                raw::TEE_ALG_PBKDF2_HMAC_SM3_DERIVE_KEY,
+            ),
+        ];
+        for (algo, expected) in cases {
+            assert_eq!(algo as u32, expected, "algorithm ID mismatch for {algo}");
+        }
+    }
+
+    #[test]
+    // Guarantee: the high-level PBKDF2 object type and attribute IDs map
+    // 1:1 to the OP-TEE raw constants, so password objects and PBKDF2
+    // operation parameters are built with the correct IDs.
+    fn pbkdf2_object_and_attribute_ids_match_raw_constants() {
+        let object_cases = [(
+            TransientObjectType::Pbkdf2Password,
+            raw::TEE_TYPE_PBKDF2_PASSWORD,
+        )];
+        for (obj_type, expected) in object_cases {
+            assert_eq!(obj_type as u32, expected, "ID mismatch for {obj_type}");
+        }
+        let attr_cases = [
+            (AttributeId::Pbkdf2Password, raw::TEE_ATTR_PBKDF2_PASSWORD),
+            (AttributeId::Pbkdf2Salt, raw::TEE_ATTR_PBKDF2_SALT),
+            (
+                AttributeId::Pbkdf2IterationCount,
+                raw::TEE_ATTR_PBKDF2_ITERATION_COUNT,
+            ),
+            (
+                AttributeId::Pbkdf2DkmLength,
+                raw::TEE_ATTR_PBKDF2_DKM_LENGTH,
+            ),
+        ];
+        for (attr, expected) in attr_cases {
+            assert_eq!(attr as u32, expected, "ID mismatch for {attr}");
+        }
+    }
+
+    const TEST_BUFFER_SIZE: usize = HEADER_SIZE + 2 * KEY_SIZE;
+
+    #[repr(align(4))]
+    struct AlignedBuffer([u8; TEST_BUFFER_SIZE]);
+
+    impl AlignedBuffer {
+        fn with_keys(number_of_keys: u32) -> Self {
+            let mut buffer = Self([0; TEST_BUFFER_SIZE]);
+            let base = buffer.0.as_mut_ptr();
+
+            // SAFETY: the buffer is 4-byte aligned and large enough for the
+            // header plus two keys.
+            unsafe {
+                let header = base.cast::<raw::TEE_OperationInfoMultiple>();
+                (*header).numberOfKeys = number_of_keys;
+
+                let keys = base
+                    .add(mem::size_of::<raw::TEE_OperationInfoMultiple>())
+                    .cast::<raw::TEE_OperationInfoKey>();
+                for index in 0..number_of_keys as usize {
+                    (*keys.add(index)).keySize = index as u32 + 1;
+                }
+            }
+            buffer
+        }
+    }
+
+    #[test]
+    // Guarantee: from_buffer exposes exactly `numberOfKeys` entries and the
+    // buffer-size helper matches the C layout.
+    fn operation_info_multiple_from_buffer() {
+        for number_of_keys in 0..=2_u32 {
+            let storage = AlignedBuffer::with_keys(number_of_keys);
+            let info = OperationInfoMultiple::from_buffer(&storage.0).unwrap();
+
+            assert_eq!(info.raw().numberOfKeys, number_of_keys);
+            assert_eq!(info.keys().len(), number_of_keys as usize);
+            for (index, key) in info.keys().iter().enumerate() {
+                assert_eq!(key.keySize, index as u32 + 1);
+            }
+        }
+    }
+
+    #[test]
+    // Guarantee: a buffer that is short, misaligned, or too small for the
+    // reported keys is rejected.
+    fn operation_info_multiple_rejects_bad_input() {
+        let storage = AlignedBuffer::with_keys(0);
+
+        let Err(short) = OperationInfoMultiple::from_buffer(&storage.0[..HEADER_SIZE - 1]) else {
+            panic!("a buffer shorter than the header must be rejected");
+        };
+        assert_eq!(short.kind(), ErrorKind::BadParameters);
+
+        let Err(unaligned) = OperationInfoMultiple::from_buffer(&storage.0[1..]) else {
+            panic!("an unaligned buffer must be rejected");
+        };
+        assert_eq!(unaligned.kind(), ErrorKind::BadParameters);
+
+        let storage = AlignedBuffer::with_keys(2);
+        let Err(too_small) =
+            OperationInfoMultiple::from_buffer(&storage.0[..HEADER_SIZE + KEY_SIZE])
+        else {
+            panic!("keys beyond the buffer capacity must be rejected");
+        };
+        assert_eq!(too_small.kind(), ErrorKind::BadParameters);
+    }
+
+    fn fake_operation() -> OperationHandle {
+        let handle = core::ptr::NonNull::<raw::__TEE_OperationHandle>::dangling().as_ptr();
+        OperationHandle::from_raw(Box::into_raw(Box::new(handle)))
+    }
+
+    fn expect_free_operation() -> impl Sized {
+        let free = mock_api::TEE_FreeOperation_context();
+        free.expect().times(1).returning(|_| {});
+        free
+    }
+
+    unsafe fn write_header(info: *mut raw::TEE_OperationInfoMultiple, number_of_keys: u32) {
+        unsafe { (*info).numberOfKeys = number_of_keys };
+    }
+
+    unsafe fn write_keys(info: *mut raw::TEE_OperationInfoMultiple, number_of_keys: u32) {
+        let keys = unsafe {
+            info.cast::<u8>()
+                .add(HEADER_SIZE)
+                .cast::<raw::TEE_OperationInfoKey>()
+        };
+        for index in 0..number_of_keys as usize {
+            unsafe { (*keys.add(index)).keySize = index as u32 + 1 };
+        }
+    }
+
+    #[test]
+    // Guarantee: info_multiple propagates SHORT_BUFFER without retrying.
+    fn info_multiple_propagates_short_buffer() {
+        let _lock = SERIAL_TEST_LOCK.lock().expect("should get the lock");
+        let _free = expect_free_operation();
+
+        let get = mock_api::TEE_GetOperationInfoMultiple_context();
+        get.expect()
+            .times(1)
+            .return_const(raw::TEE_ERROR_SHORT_BUFFER);
+
+        let operation = fake_operation();
+        let mut buffer = AlignedBuffer::with_keys(0);
+        let Err(error) = operation.info_multiple(&mut buffer.0) else {
+            panic!("SHORT_BUFFER must be propagated");
+        };
+        assert_eq!(error.kind(), ErrorKind::ShortBuffer);
+    }
+
+    #[test]
+    // Guarantee: info_multiple returns the header and keys reported by OP-TEE.
+    fn info_multiple_success() {
+        let _lock = SERIAL_TEST_LOCK.lock().expect("should get the lock");
+        let _free = expect_free_operation();
+
+        let get = mock_api::TEE_GetOperationInfoMultiple_context();
+        get.expect().times(1).returning(|_op, info, size| {
+            unsafe {
+                write_header(info, 2);
+                write_keys(info, 2);
+                *size = HEADER_SIZE + 2 * KEY_SIZE;
+            }
+            raw::TEE_SUCCESS
+        });
+
+        let operation = fake_operation();
+        let mut buffer = AlignedBuffer::with_keys(0);
+        let info = operation.info_multiple(&mut buffer.0).unwrap();
+
+        assert_eq!(info.raw().numberOfKeys, 2);
+        assert_eq!(info.keys()[1].keySize, 2);
+    }
 }

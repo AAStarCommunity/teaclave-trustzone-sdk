@@ -15,10 +15,11 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use alloc::vec::Vec;
 use optee_utee_sys as raw;
 
 use super::{DataFlag, GenericObject, ObjectHandle, ObjectStorageConstants, Whence};
-use crate::{Error, Result};
+use crate::{ErrorKind, Result, tee_check};
 
 /// An object identified by an Object Identifier and including a Data Stream.
 ///
@@ -88,7 +89,7 @@ impl PersistentObject {
         // Move as much code as possible out of unsafe blocks to maximize Rust’s
         // safety checks.
         let handle_mut = &mut handle;
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_OpenPersistentObject(
                 storage_id as u32,
                 object_id.as_ptr() as _,
@@ -96,10 +97,8 @@ impl PersistentObject {
                 flags.bits(),
                 handle_mut,
             )
-        } {
-            raw::TEE_SUCCESS => Ok(Self(ObjectHandle::from_raw(handle)?)),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })?;
+        Ok(Self(ObjectHandle::from_raw(handle)?))
     }
 
     /// Create an object with initial attributes and an initial data stream
@@ -180,7 +179,7 @@ impl PersistentObject {
             Some(a) => unsafe { *a.as_raw_ref() },
             None => core::ptr::null_mut(),
         };
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_CreatePersistentObject(
                 storage_id as u32,
                 object_id.as_ptr() as _,
@@ -191,10 +190,8 @@ impl PersistentObject {
                 initial_data.len(),
                 handle_mut,
             )
-        } {
-            raw::TEE_SUCCESS => Ok(Self(ObjectHandle::from_raw(handle)?)),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })?;
+        Ok(Self(ObjectHandle::from_raw(handle)?))
     }
 
     /// Marks an object for deletion and closes the object.
@@ -250,10 +247,8 @@ impl PersistentObject {
     /// # Ok(())
     /// # }
     pub fn close_and_delete(self) -> Result<()> {
-        let result = match unsafe { raw::TEE_CloseAndDeletePersistentObject1(*self.as_raw_ref()) } {
-            raw::TEE_SUCCESS => Ok(()),
-            code => Err(Error::from_raw_error(code)),
-        };
+        let result =
+            tee_check(unsafe { raw::TEE_CloseAndDeletePersistentObject1(*self.as_raw_ref()) });
         // According to `GPD_TEE_Internal_Core_API_Specification_v1.3.1`:
         // At 5.7.4 TEE_CloseAndDeletePersistentObject1:
         // Deleting an object is atomic; once this function returns, the object
@@ -312,16 +307,13 @@ impl PersistentObject {
     ///    function which is not explicitly associated with a defined return
     ///    code for this function.
     pub fn rename(&mut self, new_object_id: &[u8]) -> Result<()> {
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_RenamePersistentObject(
                 *self.0.as_raw_ref(),
                 new_object_id.as_ptr() as _,
                 new_object_id.len(),
             )
-        } {
-            raw::TEE_SUCCESS => Ok(()),
-            code => Err(Error::from_raw_error(code)),
-        }
+        })
     }
 
     /// Read requested size from the data stream associate with the object into
@@ -329,7 +321,9 @@ impl PersistentObject {
     ///
     /// # Parameters
     ///
-    /// 1) `buffer`: A pre-allocated buffer for saving the object's data stream.
+    /// 1) `buffer`: A pre-allocated TA-private buffer for saving the object's
+    ///    data stream. Client-shared memory must not be passed here; use
+    ///    [`Self::read_remaining_to_vec`] and copy the result to the client instead.
     /// 2) `count`: The returned value contains the number of bytes read.
     /// # Example
     ///
@@ -369,17 +363,41 @@ impl PersistentObject {
     ///    code for this function.
     pub fn read(&mut self, buf: &mut [u8]) -> Result<u32> {
         let mut count: usize = 0;
-        match unsafe {
+        tee_check(unsafe {
             raw::TEE_ReadObjectData(
                 *self.as_raw_ref(),
                 buf.as_mut_ptr() as _,
                 buf.len(),
                 &mut count,
             )
-        } {
-            raw::TEE_SUCCESS => Ok(count as u32),
-            code => Err(Error::from_raw_error(code)),
+        })?;
+        Ok(count as u32)
+    }
+
+    /// Reads the remaining data from the current cursor into a new TA-private vector.
+    ///
+    /// This method does not rewind the cursor. To read the entire object, first
+    /// call `seek(0, Whence::DataSeekSet)`.
+    ///
+    /// The allocation is sized using the object's current metadata. The returned
+    /// vector contains only the bytes actually read, and the data position advances
+    /// accordingly. At or beyond the end of the object, returns an empty vector.
+    /// Concurrent growth after the metadata query is not included in this read.
+    ///
+    /// Returns errors from [`GenericObject::info`] or [`Self::read`], or
+    /// [`ErrorKind::OutOfMemory`] if the allocation fails.
+    pub fn read_remaining_to_vec(&mut self) -> Result<Vec<u8>> {
+        let info = self.info()?;
+        let size = info.data_size().saturating_sub(info.raw.dataPosition);
+        let mut data = Vec::new();
+        if size != 0 {
+            data.try_reserve_exact(size)
+                .map_err(|_| ErrorKind::OutOfMemory)?;
+            data.resize(size, 0);
+            let count = self.read(&mut data)?;
+            data.truncate(count as usize);
         }
+        Ok(data)
     }
 
     /// Write the passed in buffer data into from the data stream associate with
@@ -430,11 +448,9 @@ impl PersistentObject {
     ///    function which is not explicitly associated with a defined return
     ///    code for this function.
     pub fn write(&mut self, buf: &[u8]) -> Result<()> {
-        match unsafe { raw::TEE_WriteObjectData(*self.as_raw_ref(), buf.as_ptr() as _, buf.len()) }
-        {
-            raw::TEE_SUCCESS => Ok(()),
-            code => Err(Error::from_raw_error(code)),
-        }
+        tee_check(unsafe {
+            raw::TEE_WriteObjectData(*self.as_raw_ref(), buf.as_ptr() as _, buf.len())
+        })
     }
 
     /// Change the size of a data stream associate with the object.
@@ -476,10 +492,7 @@ impl PersistentObject {
     ///    function which is not explicitly associated with a defined return
     ///    code for this function.
     pub fn truncate(&mut self, size: u32) -> Result<()> {
-        match unsafe { raw::TEE_TruncateObjectData(*self.as_raw_ref(), size as usize) } {
-            raw::TEE_SUCCESS => Ok(()),
-            code => Err(Error::from_raw_error(code)),
-        }
+        tee_check(unsafe { raw::TEE_TruncateObjectData(*self.as_raw_ref(), size as usize) })
     }
 
     /// Set the data position indicator associate with the object.
@@ -525,10 +538,9 @@ impl PersistentObject {
     ///    function which is not explicitly associated with a defined return
     ///    code for this function.
     pub fn seek(&mut self, offset: i32, whence: Whence) -> Result<()> {
-        match unsafe { raw::TEE_SeekObjectData(*self.as_raw_ref(), offset.into(), whence.into()) } {
-            raw::TEE_SUCCESS => Ok(()),
-            code => Err(Error::from_raw_error(code)),
-        }
+        tee_check(unsafe {
+            raw::TEE_SeekObjectData(*self.as_raw_ref(), offset.into(), whence.into())
+        })
     }
 }
 
@@ -548,6 +560,87 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn test_read_remaining_to_vec() {
+        let _lock = SERIAL_TEST_LOCK.lock().expect("should get the lock");
+        // Full read, nonzero position, short read, empty object, EOF, and beyond EOF.
+        for (size, position, bytes) in [
+            (4, 0, &b"data"[..]),
+            (4, 2, &b"ta"[..]),
+            (4, 0, &b"da"[..]),
+            (0, 0, &b""[..]),
+            (4, 4, &b""[..]),
+            (4, 6, &b""[..]),
+        ] {
+            let mut raw_handle = MockHandle::new();
+            let handle = raw_handle.as_handle();
+            let info = mock_api::TEE_GetObjectInfo1_context();
+            let read = mock_api::TEE_ReadObjectData_context();
+            let close = mock_api::TEE_CloseObject_context();
+            info.expect().times(1).return_once_st(move |_, info| {
+                unsafe {
+                    (*info).dataSize = size;
+                    (*info).dataPosition = position;
+                }
+                raw::TEE_SUCCESS
+            });
+            if position < size {
+                read.expect()
+                    .times(1)
+                    .return_once_st(move |_, buf, len, count| {
+                        assert_eq!(len, size - position);
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.cast(), bytes.len());
+                            *count = bytes.len();
+                        }
+                        raw::TEE_SUCCESS
+                    });
+            } else {
+                read.expect().never();
+            }
+            close.expect().times(1).return_once_st(|_| ());
+            let mut object = PersistentObject(ObjectHandle::from_raw(handle).unwrap());
+            assert_eq!(object.read_remaining_to_vec().unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn test_read_remaining_to_vec_errors() {
+        let _lock = SERIAL_TEST_LOCK.lock().expect("should get the lock");
+        for (info_error, size, expected) in [
+            (
+                raw::TEE_ERROR_STORAGE_NOT_AVAILABLE,
+                4,
+                raw::TEE_ERROR_STORAGE_NOT_AVAILABLE,
+            ),
+            (raw::TEE_SUCCESS, 4, raw::TEE_ERROR_CORRUPT_OBJECT),
+            (raw::TEE_SUCCESS, usize::MAX, raw::TEE_ERROR_OUT_OF_MEMORY),
+        ] {
+            let mut raw_handle = MockHandle::new();
+            let handle = raw_handle.as_handle();
+            let info = mock_api::TEE_GetObjectInfo1_context();
+            let read = mock_api::TEE_ReadObjectData_context();
+            let close = mock_api::TEE_CloseObject_context();
+            info.expect().times(1).return_once_st(move |_, info| {
+                unsafe { (*info).dataSize = size };
+                info_error
+            });
+            if info_error == raw::TEE_SUCCESS && size == 4 {
+                read.expect()
+                    .times(1)
+                    .return_once_st(|_, _, _, _| raw::TEE_ERROR_CORRUPT_OBJECT);
+            } else {
+                read.expect().never();
+            }
+            close.expect().times(1).return_once_st(|_| ());
+            let mut object = PersistentObject(ObjectHandle::from_raw(handle).unwrap());
+            assert_eq!(
+                object.read_remaining_to_vec().unwrap_err().raw_code(),
+                expected
+            );
+        }
+    }
 
     #[test]
     // If a persistent object is successfully created, TEE_CloseObject will be

@@ -67,18 +67,35 @@ pub type TcpStream = Socket<TcpAdapter>;
 /// A UdpSocket that is compatible with OP-TEE.
 pub type UdpSocket = Socket<UdpAdapter>;
 
-fn handle_socket_operation_error(handle: raw::TEE_iSocketHandle, code: u32) -> SocketError {
+/// Maps a failed socket operation to a [`SocketError`], resolving the
+/// protocol-specific code that accompanies `TEE_ISOCKET_ERROR_PROTOCOL` and
+/// `TEE_ISOCKET_WARNING_PROTOCOL`.
+///
+/// `socket` must be the `TEE_iSocket` instance that created `handle`. The GP
+/// TEE Sockets API only allows a handle to be passed to methods of its own
+/// instance, and `error` reads the protocol state of that instance through it.
+fn handle_socket_operation_error(
+    socket: *const raw::TEE_iSocket,
+    handle: raw::TEE_iSocketHandle,
+    code: u32,
+) -> SocketError {
+    // `error` is optional, so an implementation that omits it reports the
+    // protocol-specific code as 0 instead of panicking.
+    let protocol_error = || match unsafe { (*socket).error } {
+        Some(error) => unsafe { error(handle) },
+        None => 0,
+    };
     match code {
-        raw::TEE_ISOCKET_ERROR_PROTOCOL => {
-            let protocol_error = unsafe { ((*raw::TEE_tcpSocket).error)(handle) };
-            SocketError::ErrorProtocol(protocol_error)
-        }
-        raw::TEE_ISOCKET_WARNING_PROTOCOL => {
-            let protocol_error = unsafe { ((*raw::TEE_tcpSocket).error)(handle) };
-            SocketError::WarningProtocol(protocol_error)
-        }
+        raw::TEE_ISOCKET_ERROR_PROTOCOL => SocketError::ErrorProtocol(protocol_error()),
+        raw::TEE_ISOCKET_WARNING_PROTOCOL => SocketError::WarningProtocol(protocol_error()),
         _ => SocketError::from_raw_error(code, 0),
     }
+}
+
+/// Error reported when OP-TEE's socket implementation leaves a callback unset,
+/// for example an operation the selected protocol does not provide.
+fn not_supported() -> SocketError {
+    SocketError::from_raw_error(raw::TEE_ERROR_NOT_SUPPORTED, 0)
 }
 
 impl SocketAdapter for TcpAdapter {
@@ -93,8 +110,9 @@ impl SocketAdapter for TcpAdapter {
             server_addr: setup.addr.as_ptr() as _,
             server_port: setup.port,
         };
+        let open = unsafe { (*raw::TEE_tcpSocket).open }.ok_or_else(not_supported)?;
         let ret = unsafe {
-            ((*raw::TEE_tcpSocket).open)(
+            open(
                 &mut handle,
                 &mut setup as *mut raw::TEE_tcpSocket_Setup as _,
                 &mut protocol_error,
@@ -107,31 +125,37 @@ impl SocketAdapter for TcpAdapter {
     }
     fn send(handle: &mut Self::Handle, buf: &[u8], timeout: u32) -> Result<usize, SocketError> {
         let mut length: u32 = buf.len() as _;
-        let ret = unsafe {
-            ((*raw::TEE_tcpSocket).send)(handle.0, buf.as_ptr() as _, &mut length, timeout)
-        };
+        let send = unsafe { (*raw::TEE_tcpSocket).send }.ok_or_else(not_supported)?;
+        let ret = unsafe { send(handle.0, buf.as_ptr() as _, &mut length, timeout) };
         match ret {
             raw::TEE_SUCCESS => Ok(length as usize),
-            _ => Err(handle_socket_operation_error(handle.0, ret)),
+            _ => Err(handle_socket_operation_error(
+                unsafe { raw::TEE_tcpSocket },
+                handle.0,
+                ret,
+            )),
         }
     }
     fn recv(handle: &mut Self::Handle, buf: &mut [u8], timeout: u32) -> Result<usize, SocketError> {
         let mut length: u32 = buf.len() as _;
-        let ret = unsafe {
-            ((*raw::TEE_tcpSocket).recv)(handle.0, buf.as_mut_ptr() as _, &mut length, timeout)
-        };
+        let recv = unsafe { (*raw::TEE_tcpSocket).recv }.ok_or_else(not_supported)?;
+        let ret = unsafe { recv(handle.0, buf.as_mut_ptr() as _, &mut length, timeout) };
         match ret {
             raw::TEE_SUCCESS => Ok(length as usize),
-            _ => Err(handle_socket_operation_error(handle.0, ret)),
+            _ => Err(handle_socket_operation_error(
+                unsafe { raw::TEE_tcpSocket },
+                handle.0,
+                ret,
+            )),
         }
     }
 }
 
 impl Drop for TcpAdapter {
     fn drop(&mut self) {
-        // Ignore any errors on close.
-        unsafe {
-            ((*raw::TEE_tcpSocket).close)(self.0);
+        // Ignore any errors on close, including a missing callback.
+        if let Some(close) = unsafe { (*raw::TEE_tcpSocket).close } {
+            unsafe { close(self.0) };
         }
     }
 }
@@ -148,8 +172,9 @@ impl SocketAdapter for UdpAdapter {
             server_addr: setup.addr.as_ptr() as _,
             server_port: setup.port,
         };
+        let open = unsafe { (*raw::TEE_udpSocket).open }.ok_or_else(not_supported)?;
         let ret = unsafe {
-            ((*raw::TEE_udpSocket).open)(
+            open(
                 &mut handle,
                 &mut setup as *mut raw::TEE_udpSocket_Setup as _,
                 &mut protocol_error,
@@ -162,31 +187,37 @@ impl SocketAdapter for UdpAdapter {
     }
     fn send(handle: &mut Self::Handle, buf: &[u8], timeout: u32) -> Result<usize, SocketError> {
         let mut length: u32 = buf.len() as _;
-        let ret = unsafe {
-            ((*raw::TEE_udpSocket).send)(handle.0, buf.as_ptr() as _, &mut length, timeout)
-        };
+        let send = unsafe { (*raw::TEE_udpSocket).send }.ok_or_else(not_supported)?;
+        let ret = unsafe { send(handle.0, buf.as_ptr() as _, &mut length, timeout) };
         match ret {
             raw::TEE_SUCCESS => Ok(length as usize),
-            _ => Err(handle_socket_operation_error(handle.0, ret)),
+            _ => Err(handle_socket_operation_error(
+                unsafe { raw::TEE_udpSocket },
+                handle.0,
+                ret,
+            )),
         }
     }
     fn recv(handle: &mut Self::Handle, buf: &mut [u8], timeout: u32) -> Result<usize, SocketError> {
         let mut length: u32 = buf.len() as _;
-        let ret = unsafe {
-            ((*raw::TEE_udpSocket).recv)(handle.0, buf.as_mut_ptr() as _, &mut length, timeout)
-        };
+        let recv = unsafe { (*raw::TEE_udpSocket).recv }.ok_or_else(not_supported)?;
+        let ret = unsafe { recv(handle.0, buf.as_mut_ptr() as _, &mut length, timeout) };
         match ret {
             raw::TEE_SUCCESS => Ok(length as usize),
-            _ => Err(handle_socket_operation_error(handle.0, ret)),
+            _ => Err(handle_socket_operation_error(
+                unsafe { raw::TEE_udpSocket },
+                handle.0,
+                ret,
+            )),
         }
     }
 }
 
 impl Drop for UdpAdapter {
     fn drop(&mut self) {
-        // Ignore any errors on close.
-        unsafe {
-            ((*raw::TEE_udpSocket).close)(self.0);
+        // Ignore any errors on close, including a missing callback.
+        if let Some(close) = unsafe { (*raw::TEE_udpSocket).close } {
+            unsafe { close(self.0) };
         }
     }
 }

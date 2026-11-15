@@ -18,6 +18,7 @@
 #[cfg(not(feature = "std"))]
 use core::error;
 use core::{fmt, result};
+use num_enum::{FromPrimitive, IntoPrimitive};
 use optee_utee_sys as raw;
 #[cfg(feature = "std")]
 use std::error;
@@ -28,13 +29,31 @@ use std::error;
 /// # Examples
 ///
 /// ``` rust,no_run
-/// # use optee_utee::Parameters;
+/// # use optee_utee::prelude::*;
 /// use optee_utee::Result;
-/// fn open_session(params: &mut Parameters) -> Result<()> {
+/// fn open_session(params: &mut ParametersAny) -> Result<()> {
 ///     Ok(())
 /// }
 /// ````
 pub type Result<T> = result::Result<T, Error>;
+
+/// Checks the result of a TEE API call, converting a non-success code into
+/// [`Error`].
+pub(crate) fn tee_check(code: raw::TEE_Result) -> Result<()> {
+    match code {
+        raw::TEE_SUCCESS => Ok(()),
+        code => Err(Error::from_raw_error(code)),
+    }
+}
+
+/// Like [`tee_check`], but attaches the error origin returned by the TEE API
+/// on failure.
+pub(crate) fn tee_check_with_origin(code: raw::TEE_Result, origin: u32) -> Result<()> {
+    match code {
+        raw::TEE_SUCCESS => Ok(()),
+        code => Err(Error::from_raw_error(code).with_origin(origin.into())),
+    }
+}
 
 #[derive(Clone)]
 pub struct Error {
@@ -44,7 +63,13 @@ pub struct Error {
 
 /// A list specifying general categories of TEE error and its corresponding code
 /// in OP-TEE OS.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+///
+/// Unrecognized codes are preserved in the `Unknown` catch-all variant, so
+/// `raw_code()` always round-trips the value passed to
+/// [`Error::from_raw_error`].
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, FromPrimitive, IntoPrimitive,
+)]
 #[repr(u32)]
 pub enum ErrorKind {
     /// Object corruption.
@@ -107,9 +132,9 @@ pub enum ErrorKind {
     /// The persistent time has been set but may have been corrupted and SHALL
     /// no longer be trusted.
     TimeNeedsReset = raw::TEE_ERROR_TIME_NEEDS_RESET,
-    /// Unknown error.
-    #[default]
-    Unknown,
+    /// Unknown error, holding the original raw code.
+    #[num_enum(catch_all)]
+    Unknown(u32),
 }
 
 impl ErrorKind {
@@ -150,57 +175,14 @@ impl ErrorKind {
             ErrorKind::TimeNeedsReset => {
                 "The persistent time has been set but may have been corrupted and SHALL no longer be trusted."
             }
-            ErrorKind::Unknown => "Unknown error.",
-        }
-    }
-}
-
-impl From<ErrorKind> for u32 {
-    fn from(kind: ErrorKind) -> u32 {
-        kind as u32
-    }
-}
-
-impl From<u32> for ErrorKind {
-    fn from(code: u32) -> ErrorKind {
-        match code {
-            raw::TEE_ERROR_CORRUPT_OBJECT => ErrorKind::CorruptObject,
-            raw::TEE_ERROR_CORRUPT_OBJECT_2 => ErrorKind::CorruptObject2,
-            raw::TEE_ERROR_STORAGE_NOT_AVAILABLE => ErrorKind::StorageNotAvailable,
-            raw::TEE_ERROR_STORAGE_NOT_AVAILABLE_2 => ErrorKind::StorageNotAvailable2,
-            raw::TEE_ERROR_GENERIC => ErrorKind::Generic,
-            raw::TEE_ERROR_ACCESS_DENIED => ErrorKind::AccessDenied,
-            raw::TEE_ERROR_CANCEL => ErrorKind::Cancel,
-            raw::TEE_ERROR_ACCESS_CONFLICT => ErrorKind::AccessConflict,
-            raw::TEE_ERROR_EXCESS_DATA => ErrorKind::ExcessData,
-            raw::TEE_ERROR_BAD_FORMAT => ErrorKind::BadFormat,
-            raw::TEE_ERROR_BAD_PARAMETERS => ErrorKind::BadParameters,
-            raw::TEE_ERROR_BAD_STATE => ErrorKind::BadState,
-            raw::TEE_ERROR_ITEM_NOT_FOUND => ErrorKind::ItemNotFound,
-            raw::TEE_ERROR_NOT_IMPLEMENTED => ErrorKind::NotImplemented,
-            raw::TEE_ERROR_NOT_SUPPORTED => ErrorKind::NotSupported,
-            raw::TEE_ERROR_NO_DATA => ErrorKind::NoData,
-            raw::TEE_ERROR_OUT_OF_MEMORY => ErrorKind::OutOfMemory,
-            raw::TEE_ERROR_BUSY => ErrorKind::Busy,
-            raw::TEE_ERROR_COMMUNICATION => ErrorKind::Communication,
-            raw::TEE_ERROR_SECURITY => ErrorKind::Security,
-            raw::TEE_ERROR_SHORT_BUFFER => ErrorKind::ShortBuffer,
-            raw::TEE_ERROR_EXTERNAL_CANCEL => ErrorKind::ExternalCancel,
-            raw::TEE_ERROR_OVERFLOW => ErrorKind::Overflow,
-            raw::TEE_ERROR_TARGET_DEAD => ErrorKind::TargetDead,
-            raw::TEE_ERROR_STORAGE_NO_SPACE => ErrorKind::StorageNoSpace,
-            raw::TEE_ERROR_MAC_INVALID => ErrorKind::MacInvalid,
-            raw::TEE_ERROR_SIGNATURE_INVALID => ErrorKind::SignatureInvalid,
-            raw::TEE_ERROR_TIME_NOT_SET => ErrorKind::TimeNotSet,
-            raw::TEE_ERROR_TIME_NEEDS_RESET => ErrorKind::TimeNeedsReset,
-            _ => ErrorKind::Unknown,
+            ErrorKind::Unknown(_) => "Unknown error.",
         }
     }
 }
 
 impl Error {
     pub fn new(kind: ErrorKind) -> Error {
-        Error { kind, origin: None }
+        kind.into()
     }
 
     /// Creates a new instance of an `Error` from a particular TEE error code.
@@ -214,10 +196,7 @@ impl Error {
     /// assert_eq!(error.kind(), optee_utee::ErrorKind::Security);
     /// ```
     pub fn from_raw_error(code: u32) -> Error {
-        Error {
-            kind: ErrorKind::from(code),
-            origin: None,
-        }
+        ErrorKind::from(code).into()
     }
 
     pub fn with_origin(mut self, origin: ErrorOrigin) -> Self {
@@ -311,5 +290,35 @@ impl From<u32> for ErrorOrigin {
             raw::TEE_ORIGIN_TRUSTED_APP => ErrorOrigin::Ta,
             _ => ErrorOrigin::Unknown,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guarantees: unrecognized codes are preserved in the catch-all variant
+    /// and round-trip through `Error`.
+    #[test]
+    fn unknown_raw_code_round_trips() {
+        let code = 0x1234_5678;
+        assert_eq!(ErrorKind::from(code), ErrorKind::Unknown(code));
+        let back: u32 = ErrorKind::Unknown(code).into();
+        assert_eq!(back, code);
+
+        let err = Error::from_raw_error(code);
+        assert_eq!(err.kind(), ErrorKind::Unknown(code));
+        assert_eq!(err.raw_code(), code);
+    }
+
+    /// Guarantees: known codes still map to their named variants.
+    #[test]
+    fn known_codes_still_map() {
+        assert_eq!(
+            ErrorKind::from(raw::TEE_ERROR_SECURITY),
+            ErrorKind::Security
+        );
+        let code: u32 = ErrorKind::Security.into();
+        assert_eq!(code, raw::TEE_ERROR_SECURITY);
     }
 }

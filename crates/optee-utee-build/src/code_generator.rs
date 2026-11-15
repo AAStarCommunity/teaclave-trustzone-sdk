@@ -53,7 +53,7 @@ impl HeaderFileGenerator {
         self.write_ta_head(conf)?;
         self.write_ta_heap();
 
-        const LICENSE_STR: &str = include_str!("./license_str.txt");
+        const LICENSE_STR: &str = include_str!("./license_header.txt");
         let f = syn::parse2(self.code).unwrap();
         // prettyplease will remove all of the comments in it, and the
         // maintainer will not support keeping comments,
@@ -74,6 +74,10 @@ impl HeaderFileGenerator {
 
     fn write_trace(&mut self, conf: &TaConfig) {
         let trace_ext = string_to_binary_codes(&conf.trace_ext_prefix);
+        // C declares this symbol as `extern const char trace_ext_prefix[]`, so
+        // the generated static must be an array. Its length includes the
+        // terminating NUL that `string_to_binary_codes` appends.
+        let trace_ext_len = conf.trace_ext_prefix.len() + 1;
         let trace_level = conf.trace_level;
         let no_mangle_attribute = no_mangle_attribute_codes();
         self.code.extend(quote! {
@@ -81,7 +85,10 @@ impl HeaderFileGenerator {
         pub static mut trace_level: c_int = #trace_level;
 
         #no_mangle_attribute
-        pub static trace_ext_prefix: &[u8] = #trace_ext;
+        // Dereference the byte string to copy its bytes into an array.
+        // Exporting a `&[u8]` static would make `#[unsafe(no_mangle)]` export
+        // a fat pointer (data pointer plus length) instead of the C string.
+        pub static trace_ext_prefix: [u8; #trace_ext_len] = *#trace_ext;
 
         /// # Safety
         /// This function is called by the OP-TEE framework to get the trace level.
@@ -121,9 +128,9 @@ impl HeaderFileGenerator {
             let utee_type_name_codes = property_value_utee_type_codes(&prop.value);
             let utee_value_conv_codes = property_value_as_utee_value_codes(&var_name, &prop.value);
             ext_property_codes.push(quote! {
-                optee_utee_sys::user_ta_property {
-                    name: #prop_name_codes.as_ptr(),
-                    prop_type: #utee_type_name_codes,
+                optee_utee::raw::user_ta_property {
+                    name: #prop_name_codes.as_ptr().cast(),
+                    type_: #utee_type_name_codes,
                     value: #utee_value_conv_codes,
                 }
             });
@@ -133,68 +140,81 @@ impl HeaderFileGenerator {
         let property_len = ORIGIN_PROPERTY_LEN + conf.ext_properties.len();
         let no_mangle_attribute = no_mangle_attribute_codes();
         self.code.extend(quote! {
-        const IS_SINGLE_INSTANCE: bool = (TA_FLAGS & optee_utee_sys::TA_FLAG_SINGLE_INSTANCE) != 0;
-        const IS_MULTI_SESSION: bool = (TA_FLAGS & optee_utee_sys::TA_FLAG_MULTI_SESSION) != 0;
-        const IS_KEEP_ALIVE: bool = (TA_FLAGS & optee_utee_sys::TA_FLAG_INSTANCE_KEEP_ALIVE) != 0;
-        const IS_KEEP_CRASHED: bool = (TA_FLAGS & optee_utee_sys::TA_FLAG_INSTANCE_KEEP_CRASHED) != 0;
+        /// The TA property table exported as `ta_props`.
+        ///
+        /// `libutee` reads it through an `extern const struct user_ta_property
+        /// ta_props[]`, so it must be a `static` with exactly this layout.
+        /// `user_ta_property` holds raw pointers and is therefore not `Sync` on
+        /// its own; every pointer in the table points to immutable data in the
+        /// TA image (`&'static` property names and values) and nothing ever
+        /// writes through it, so sharing the table is sound.
+        #[repr(transparent)]
+        pub struct TaProperties<const N: usize>([optee_utee::raw::user_ta_property; N]);
+
+        unsafe impl<const N: usize> Sync for TaProperties<N> {}
+
+        const IS_SINGLE_INSTANCE: bool = (TA_FLAGS & optee_utee::raw::TA_FLAG_SINGLE_INSTANCE) != 0;
+        const IS_MULTI_SESSION: bool = (TA_FLAGS & optee_utee::raw::TA_FLAG_MULTI_SESSION) != 0;
+        const IS_KEEP_ALIVE: bool = (TA_FLAGS & optee_utee::raw::TA_FLAG_INSTANCE_KEEP_ALIVE) != 0;
+        const IS_KEEP_CRASHED: bool = (TA_FLAGS & optee_utee::raw::TA_FLAG_INSTANCE_KEEP_CRASHED) != 0;
         const TA_ENDIAN: u32 = 0;
-        const DONT_CLOSE_HANDLE_ON_CORRUPT_OBJECT: bool = (TA_FLAGS & optee_utee_sys::TA_FLAG_DONT_CLOSE_HANDLE_ON_CORRUPT_OBJECT) != 0;
+        const DONT_CLOSE_HANDLE_ON_CORRUPT_OBJECT: bool = (TA_FLAGS & optee_utee::raw::TA_FLAG_DONT_CLOSE_HANDLE_ON_CORRUPT_OBJECT) != 0;
         #no_mangle_attribute
         pub static ta_num_props: usize = #property_len;
         #no_mangle_attribute
-        pub static ta_props: [optee_utee_sys::user_ta_property; #property_len] = [
-            optee_utee_sys::user_ta_property {
-                name: optee_utee_sys::TA_PROP_STR_SINGLE_INSTANCE,
-                prop_type: optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_BOOL,
+        pub static ta_props: TaProperties<#property_len> = TaProperties([
+            optee_utee::raw::user_ta_property {
+                name: optee_utee::raw::TA_PROP_STR_SINGLE_INSTANCE.as_ptr().cast(),
+                type_: optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_BOOL,
                 value: &IS_SINGLE_INSTANCE as *const bool as _,
             },
-            optee_utee_sys::user_ta_property {
-                name: optee_utee_sys::TA_PROP_STR_MULTI_SESSION,
-                prop_type: optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_BOOL,
+            optee_utee::raw::user_ta_property {
+                name: optee_utee::raw::TA_PROP_STR_MULTI_SESSION.as_ptr().cast(),
+                type_: optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_BOOL,
                 value: &IS_MULTI_SESSION as *const bool as _,
             },
-            optee_utee_sys::user_ta_property {
-                name: optee_utee_sys::TA_PROP_STR_KEEP_ALIVE,
-                prop_type: optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_BOOL,
+            optee_utee::raw::user_ta_property {
+                name: optee_utee::raw::TA_PROP_STR_KEEP_ALIVE.as_ptr().cast(),
+                type_: optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_BOOL,
                 value: &IS_KEEP_ALIVE as *const bool as _,
             },
-            optee_utee_sys::user_ta_property {
-                name: optee_utee_sys::TA_PROP_STR_KEEP_CRASHED,
-                prop_type: optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_BOOL,
+            optee_utee::raw::user_ta_property {
+                name: optee_utee::raw::TA_PROP_STR_KEEP_CRASHED.as_ptr().cast(),
+                type_: optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_BOOL,
                 value: &IS_KEEP_CRASHED as *const bool as _,
             },
-            optee_utee_sys::user_ta_property {
-                name: optee_utee_sys::TA_PROP_STR_DATA_SIZE,
-                prop_type: optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_U32,
+            optee_utee::raw::user_ta_property {
+                name: optee_utee::raw::TA_PROP_STR_DATA_SIZE.as_ptr().cast(),
+                type_: optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_U32,
                 value: &TA_DATA_SIZE as *const u32 as _,
             },
-            optee_utee_sys::user_ta_property {
-                name: optee_utee_sys::TA_PROP_STR_STACK_SIZE,
-                prop_type: optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_U32,
+            optee_utee::raw::user_ta_property {
+                name: optee_utee::raw::TA_PROP_STR_STACK_SIZE.as_ptr().cast(),
+                type_: optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_U32,
                 value: &TA_STACK_SIZE as *const u32 as _,
             },
-            optee_utee_sys::user_ta_property {
-                name: optee_utee_sys::TA_PROP_STR_VERSION,
-                prop_type: optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_STRING,
+            optee_utee::raw::user_ta_property {
+                name: optee_utee::raw::TA_PROP_STR_VERSION.as_ptr().cast(),
+                type_: optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_STRING,
                 value: TA_VERSION as *const [u8] as _,
             },
-            optee_utee_sys::user_ta_property {
-                name: optee_utee_sys::TA_PROP_STR_DESCRIPTION,
-                prop_type: optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_STRING,
+            optee_utee::raw::user_ta_property {
+                name: optee_utee::raw::TA_PROP_STR_DESCRIPTION.as_ptr().cast(),
+                type_: optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_STRING,
                 value: TA_DESCRIPTION as *const [u8] as _,
             },
-            optee_utee_sys::user_ta_property {
-                name: optee_utee_sys::TA_PROP_STR_ENDIAN,
-                prop_type: optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_U32,
+            optee_utee::raw::user_ta_property {
+                name: optee_utee::raw::TA_PROP_STR_ENDIAN.as_ptr().cast(),
+                type_: optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_U32,
                 value: &TA_ENDIAN as *const u32 as _,
             },
-            optee_utee_sys::user_ta_property {
-                name: optee_utee_sys::TA_PROP_STR_DOES_NOT_CLOSE_HANDLE_ON_CORRUPT_OBJECT,
-                prop_type: optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_BOOL,
+            optee_utee::raw::user_ta_property {
+                name: optee_utee::raw::TA_PROP_STR_DOES_NOT_CLOSE_HANDLE_ON_CORRUPT_OBJECT.as_ptr().cast(),
+                type_: optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_BOOL,
                 value: &DONT_CLOSE_HANDLE_ON_CORRUPT_OBJECT as *const bool as _,
             },
             #(#ext_property_codes),*
-        ];
+        ]);
                 });
 
         Ok(())
@@ -207,7 +227,7 @@ impl HeaderFileGenerator {
         self.code.extend(quote! {
         #no_mangle_attribute
         #ta_head_session_attribute
-        pub static ta_head: optee_utee_sys::ta_head = optee_utee_sys::ta_head {
+        pub static ta_head: optee_utee::raw::ta_head = optee_utee::raw::ta_head {
             uuid: #uuid_value_codes,
             stack_size: #stack_size,
             flags: TA_FLAGS,
@@ -223,7 +243,10 @@ impl HeaderFileGenerator {
         self.code.extend(quote! {
         #no_mangle_attribute
         #bss_session_attribute
-        pub static ta_heap: [u8; TA_DATA_SIZE as usize] = [0; TA_DATA_SIZE as usize];
+        // OP-TEE hands this buffer to its allocator, which writes to it. The
+        // generated TA code never touches it directly, but `static mut`
+        // records that the memory is mutated outside Rust.
+        pub static mut ta_heap: [u8; TA_DATA_SIZE as usize] = [0; TA_DATA_SIZE as usize];
 
         #no_mangle_attribute
         pub static ta_heap_size: usize = mem::size_of::<u8>() * TA_DATA_SIZE as usize;
@@ -246,7 +269,7 @@ fn property_value_data_codes(value: &PropertyValue) -> Result<proc_macro2::Token
 fn uuid_to_tee_uuid_value_codes(uuid: &uuid::Uuid) -> Result<proc_macro2::TokenStream, Error> {
     let (time_low, time_mid, time_hi_and_version, clock_seq_and_node) = uuid.as_fields();
     Ok(quote! {
-    optee_utee_sys::TEE_UUID {
+    optee_utee::raw::TEE_UUID {
         timeLow: #time_low,
         timeMid: #time_mid,
         timeHiAndVersion: #time_hi_and_version,
@@ -261,7 +284,7 @@ fn identity_to_tee_identity_value_codes(
 ) -> Result<proc_macro2::TokenStream, Error> {
     let tee_uuid_codes = uuid_to_tee_uuid_value_codes(uuid)?;
     Ok(quote! {
-        optee_utee_sys::TEE_Identity {
+        optee_utee::raw::TEE_Identity {
             login: #login,
             uuid: #tee_uuid_codes,
         }
@@ -273,10 +296,10 @@ fn property_value_rust_type_declaration_codes(value: &PropertyValue) -> proc_mac
         PropertyValue::U32(_) => "u32",
         PropertyValue::U64(_) => "u64",
         PropertyValue::Bool(_) => "bool",
-        PropertyValue::Uuid(_) => "optee_utee_sys::TEE_UUID",
+        PropertyValue::Uuid(_) => "optee_utee::raw::TEE_UUID",
         PropertyValue::Str(_) => "&[u8]",
         PropertyValue::BinaryBlock(_) => "&[u8]",
-        PropertyValue::Identity(..) => "optee_utee_sys::TEE_Identity",
+        PropertyValue::Identity(..) => "optee_utee::raw::TEE_Identity",
     })
     .unwrap()
 }
@@ -291,12 +314,15 @@ fn property_value_as_utee_value_codes(
             PropertyValue::U64(_) => format!("&{} as *const u64 as *mut _", var_name),
             PropertyValue::Bool(_) => format!("&{} as *const bool as *mut _", var_name),
             PropertyValue::Uuid(_) => {
-                format!("&{} as *const optee_utee_sys::TEE_UUID as *mut _", var_name)
+                format!(
+                    "&{} as *const optee_utee::raw::TEE_UUID as *mut _",
+                    var_name
+                )
             }
             PropertyValue::Str(_) => format!("{} as *const [u8] as *mut _", var_name),
             PropertyValue::BinaryBlock(_) => format!("{} as *const [u8] as *mut _", var_name),
             PropertyValue::Identity(..) => format!(
-                "&{} as *const optee_utee_sys::TEE_Identity as *mut _",
+                "&{} as *const optee_utee::raw::TEE_Identity as *mut _",
                 var_name
             ),
         }
@@ -307,24 +333,33 @@ fn property_value_as_utee_value_codes(
 
 fn property_value_utee_type_codes(value: &PropertyValue) -> proc_macro2::TokenStream {
     proc_macro2::TokenStream::from_str(match value {
-        PropertyValue::U32(_) => "optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_U32",
-        PropertyValue::U64(_) => "optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_U64",
-        PropertyValue::Bool(_) => "optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_BOOL",
-        PropertyValue::Uuid(_) => "optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_UUID",
-        PropertyValue::Str(_) => "optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_STRING",
+        PropertyValue::U32(_) => "optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_U32",
+        PropertyValue::U64(_) => "optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_U64",
+        PropertyValue::Bool(_) => "optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_BOOL",
+        PropertyValue::Uuid(_) => "optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_UUID",
+        PropertyValue::Str(_) => "optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_STRING",
         PropertyValue::BinaryBlock(_) => {
-            "optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_BINARY_BLOCK"
+            "optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_BINARY_BLOCK"
         }
         PropertyValue::Identity(..) => {
-            "optee_utee_sys::user_ta_prop_type::USER_TA_PROP_TYPE_IDENTITY"
+            "optee_utee::raw::user_ta_prop_type::USER_TA_PROP_TYPE_IDENTITY"
         }
     })
     .unwrap()
 }
 
+/// Builds a NUL-terminated byte-string literal for `s`.
+///
+/// The literal is constructed as a token, so the value of `s` is data, never
+/// source text: quotes, backslashes and non-ASCII bytes are escaped by
+/// `Literal::byte_string`. Splicing `s` into a hand-built source string and
+/// re-parsing it instead would let a quote inside `s` close the literal early
+/// and append further items to the generated header.
 fn string_to_binary_codes(s: &str) -> proc_macro2::TokenStream {
-    let wrapped = format!("b\"{}\\0\"", s);
-    proc_macro2::TokenStream::from_str(&wrapped).unwrap()
+    let mut bytes = Vec::with_capacity(s.len() + 1);
+    bytes.extend_from_slice(s.as_bytes());
+    bytes.push(0);
+    proc_macro2::TokenTree::Literal(proc_macro2::Literal::byte_string(&bytes)).into()
 }
 
 fn no_mangle_attribute_codes() -> proc_macro2::TokenStream {
@@ -346,5 +381,92 @@ mod tests {
         let codes = generator.generate(&conf).unwrap();
         let exp_result = include_str!("../test_files/test_result.rs");
         assert_eq!(codes, exp_result);
+    }
+
+    fn header_for(description: &str) -> String {
+        let uuid = "26509cec-4a2b-4935-87ab-762d89fbf0b0";
+        let conf = TaConfig::new_default(uuid, "0.1.0", description).unwrap();
+        HeaderFileGenerator::new().generate(&conf).unwrap()
+    }
+
+    /// The `ta_description` a TA gets from `new_default_with_cargo_env` is the
+    /// free-text `description` field of the TA's `Cargo.toml`. A quote in it must
+    /// stay inside the generated byte-string literal rather than closing it and
+    /// splicing further items into `user_ta_header.rs`, which is compiled and
+    /// signed into the TA.
+    #[test]
+    fn config_strings_cannot_splice_items_into_the_header() {
+        let payload = "x\"; const INJECTED: u32 = 0xDEAD_BEEF; const _P: &[u8] = b\"";
+        let codes = header_for(payload);
+
+        let file = syn::parse_file(&codes).expect("generated header must parse");
+        let spliced: Vec<String> = file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Const(item) if item.ident == "INJECTED" || item.ident == "_P" => {
+                    Some(item.ident.to_string())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            spliced.is_empty(),
+            "description spliced items into the generated header: {spliced:?}"
+        );
+
+        // The payload survives verbatim as the literal's *contents*.
+        let description = file
+            .items
+            .iter()
+            .find_map(|item| match item {
+                syn::Item::Const(item) if item.ident == "TA_DESCRIPTION" => Some(item),
+                _ => None,
+            })
+            .expect("TA_DESCRIPTION must still be generated");
+        let expr = quote::ToTokens::to_token_stream(&description.expr).to_string();
+        assert!(
+            expr.starts_with(r#"b"x\"; const INJECTED: u32 = 0xDEAD_BEEF"#),
+            "payload is no longer escaped inside the literal: {expr}"
+        );
+    }
+
+    /// Guarantees: quotes, backslashes, control characters and non-ASCII are
+    /// escaped into the literal, so the emitted header stays valid Rust for any
+    /// input the `ta_description` / `ta_version` / property strings can carry.
+    #[test]
+    fn config_strings_are_escaped_not_rejected() {
+        for payload in [
+            r#"quote " backslash \ done"#,
+            "newline \n tab \t null-ish \\0",
+            "non-ascii \u{4e2d}\u{6587} \u{1F600}",
+            "",
+        ] {
+            let codes = header_for(payload);
+            syn::parse_file(&codes)
+                .unwrap_or_else(|e| panic!("header must parse for {payload:?}: {e}"));
+        }
+    }
+
+    /// Guarantees: a configured extra property is appended to `ta_props` and its
+    /// name is coerced to `*const c_char` like the built-in entries, so the
+    /// generated table keeps compiling on targets where `c_char` is signed.
+    #[test]
+    fn ext_property_is_appended_to_ta_props() {
+        let uuid = "26509cec-4a2b-4935-87ab-762d89fbf0b0";
+        let conf = TaConfig::new_default(uuid, "0.1.0", "test")
+            .unwrap()
+            .add_ext_property("my.prop", PropertyValue::U32(1));
+        let codes = HeaderFileGenerator::new().generate(&conf).unwrap();
+
+        syn::parse_file(&codes).expect("generated header must parse");
+        assert!(
+            codes.contains("TaProperties<11usize>"),
+            "the extra property did not grow ta_props:\n{codes}"
+        );
+        assert!(
+            codes.contains(r#"name: b"my.prop\0".as_ptr().cast()"#),
+            "the extra property name is not coerced to `*const c_char`:\n{codes}"
+        );
     }
 }

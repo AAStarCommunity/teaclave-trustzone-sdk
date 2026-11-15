@@ -34,6 +34,24 @@ use std::fmt;
 /// ````
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Checks the result of a TEE client API call, converting a non-success code
+/// into [`Error`].
+pub(crate) fn teec_check(code: raw::TEEC_Result) -> Result<()> {
+    match code {
+        raw::TEEC_SUCCESS => Ok(()),
+        code => Err(Error::from_raw_error(code)),
+    }
+}
+
+/// Like [`teec_check`], but attaches the error origin returned by the TEE
+/// client API on failure.
+pub(crate) fn teec_check_with_origin(code: raw::TEEC_Result, origin: u32) -> Result<()> {
+    match code {
+        raw::TEEC_SUCCESS => Ok(()),
+        code => Err(Error::from_raw_error(code).with_origin(origin.into())),
+    }
+}
+
 /// The error type for TEE operations of [`Context`] and [`Session`].
 ///
 /// [`Context`]: struct.Context.html
@@ -89,9 +107,9 @@ pub enum ErrorKind {
     ExternalCancel = raw::TEEC_ERROR_EXTERNAL_CANCEL,
     /// Implementation defined error code: trusted Application has panicked during the operation.
     TargetDead = raw::TEEC_ERROR_TARGET_DEAD,
-    /// Unknown error.
-    #[default]
-    Unknown,
+    /// Unknown error, holding the original raw code.
+    #[num_enum(catch_all)]
+    Unknown(u32),
 }
 
 impl ErrorKind {
@@ -120,14 +138,14 @@ impl ErrorKind {
             ErrorKind::ShortBuffer => "The supplied buffer is too short for the generated output.",
             ErrorKind::ExternalCancel => "Undocumented.",
             ErrorKind::TargetDead => "Trusted Application has panicked during the operation.",
-            ErrorKind::Unknown => "Unknown error.",
+            ErrorKind::Unknown(_) => "Unknown error.",
         }
     }
 }
 
 impl Error {
     pub fn new(kind: ErrorKind) -> Error {
-        Error { kind, origin: None }
+        kind.into()
     }
     /// Creates a new instance of an `Error` from a particular TEE error code.
     ///
@@ -140,10 +158,7 @@ impl Error {
     /// assert_eq!(error.kind(), ErrorKind::Security);
     /// ```
     pub fn from_raw_error(code: u32) -> Error {
-        Error {
-            kind: ErrorKind::from(code),
-            origin: None,
-        }
+        ErrorKind::from(code).into()
     }
 
     pub fn with_origin(mut self, origin: ErrorOrigin) -> Self {
@@ -220,4 +235,23 @@ pub enum ErrorOrigin {
     TA = raw::TEEC_ORIGIN_TRUSTED_APP,
     #[default]
     UNKNOWN,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guarantees: unrecognized codes are preserved in the catch-all variant
+    /// and round-trip through `Error`.
+    #[test]
+    fn unknown_raw_code_round_trips() {
+        let code = 0x1234_5678;
+        assert_eq!(ErrorKind::from(code), ErrorKind::Unknown(code));
+        let back: u32 = ErrorKind::Unknown(code).into();
+        assert_eq!(back, code);
+
+        let err = Error::from_raw_error(code);
+        assert_eq!(err.kind(), ErrorKind::Unknown(code));
+        assert_eq!(err.raw_code(), code);
+    }
 }

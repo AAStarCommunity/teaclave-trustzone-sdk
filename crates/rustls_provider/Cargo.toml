@@ -27,8 +27,8 @@ publish = false
 
 [dependencies]
 optee-utee.workspace = true
-rustls = { version = "0.23.12", default-features = false, features = ["std"] }
-rustls-rustcrypto = "0.0.2-alpha"
-getrandom = "0.2" 
-base64ct = "1.8.3"
-ed25519-dalek = "2.2.0"
+rustls = { workspace = true, default-features = false, features = ["std"] }
+rustls-rustcrypto = { workspace = true }
+# rustls-rustcrypto still uses rand_core 0.6/OsRng, which is backed by
+# getrandom 0.2.
+getrandom = { version = "0.2.17", default-features = false }

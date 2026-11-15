@@ -38,7 +38,16 @@ jobs:
     container: ${{ inputs.container }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+      - name: Cache Cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/cache
+            ~/.cargo/registry/index
+          key: cargo-v1-build-utee-teec-${{ hashFiles('rust-toolchain.toml') }}
+          restore-keys: |
+            cargo-v1-build-utee-teec-
       - name: Building
         run: |
           # Setup Rust and toolchains
@@ -58,6 +67,12 @@ jobs:
             cargo test -p optee-teec -vv && \
             cargo test -p optee-utee-build -vv)
 
+          # Run optee-utee tests with std as well: some doctests only
+          # compile under one feature set (e.g. the net compat-trait
+          # examples resolve to different TcpStream methods per feature).
+          (cd crates && \
+            cargo test -p optee-utee --features std -vv)
+
           # Build Rust optee-utee and optee-teec
           (cd crates && \
             cargo build -p optee-utee --target aarch64-unknown-linux-gnu -vv && \
@@ -72,6 +87,12 @@ jobs:
 
           # fmt checks
           (cd crates && cargo fmt --all --check)
+
+          # cargo-optee unit tests live in tools/, not crates/.
+          (cd tools && \
+            cargo test -p cargo-optee -vv && \
+            cargo clippy -p cargo-optee -- -D warnings && \
+            cargo fmt --all --check)
 
   build-and-test-examples-for-32bit-no-std-TAs:
     uses: ./.github/workflows/reuse_host_build_and_qemu_run.yml
