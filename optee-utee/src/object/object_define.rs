@@ -57,6 +57,11 @@ pub enum ObjectStorageConstants {
     IllegalValue = 0x7FFFFFFF,
 }
 
+// Pin the storage IDs to OP-TEE's values at compile time so the RPMB ID can
+// never silently regress to an unrecognised value again (see Rpmb above).
+const _: () = assert!(ObjectStorageConstants::Private as u32 == 0x00000001);
+const _: () = assert!(ObjectStorageConstants::Rpmb as u32 == 0x80000100);
+
 bitflags! {
     /// A set of flags that controls the access rights and sharing permissions
     /// with which the object handle is opened.
