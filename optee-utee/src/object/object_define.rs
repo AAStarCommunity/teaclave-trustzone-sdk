@@ -44,10 +44,23 @@ impl Into<raw::TEE_Whence> for Whence {
 pub enum ObjectStorageConstants {
     Private = 0x00000001,
     /// RPMB-backed storage. Provides hardware anti-rollback via eMMC RPMB partition.
-    /// GP TEE Internal Core API v1.3.1 §5.11.1 — TEE_STORAGE_PRIVATE_RPMB = 0x80000003.
-    Rpmb = 0x80000003,
+    ///
+    /// This is an OP-TEE storage extension, not a GlobalPlatform-defined ID:
+    /// `TEE_STORAGE_PRIVATE_RPMB = 0x80000100` in OP-TEE
+    /// `lib/libutee/include/tee_api_defines_extensions.h` (same value in 4.7
+    /// through 4.11; upstream teaclave v0.10.0 names it `PrivateRpmb`).
+    ///
+    /// An earlier revision used 0x80000003, which OP-TEE does not recognise:
+    /// `tee_svc_storage_file_ops()` returns NULL for it and every open/create
+    /// fails with `TEE_ERROR_ITEM_NOT_FOUND`, so RPMB was never actually used.
+    Rpmb = 0x80000100,
     IllegalValue = 0x7FFFFFFF,
 }
+
+// Pin the storage IDs to OP-TEE's values at compile time so the RPMB ID can
+// never silently regress to an unrecognised value again (see Rpmb above).
+const _: () = assert!(ObjectStorageConstants::Private as u32 == 0x00000001);
+const _: () = assert!(ObjectStorageConstants::Rpmb as u32 == 0x80000100);
 
 bitflags! {
     /// A set of flags that controls the access rights and sharing permissions
